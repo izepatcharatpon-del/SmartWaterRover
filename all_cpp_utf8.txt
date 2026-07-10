@@ -1,0 +1,1359 @@
+﻿===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\main.cpp =====
+#include <Arduino.h>
+#include <Wire.h>
+
+#include "config.h"
+#include "core/Tasks.h"
+
+// ---------------------------------------------------------------------------
+// Global module instances (constructed once, wired via SystemContext).
+// ---------------------------------------------------------------------------
+static WaterSensors        water;
+static BatteryMonitor      battery;
+static Compass             compass;
+static GpsModule           gps;
+static MotorDriver         motor;
+static HeadingController   heading(HEADING_KP, HEADING_KI, HEADING_KD);
+static SpiralController    spiral;
+static EllipseTracker      ellipse;
+static Navigator           nav;
+static SpiralPlanner       spiralPlanner;
+static WaterAnomalyMonitor anomaly;
+static EspNowLink          commsLink;
+static DataLogger          logger;
+static Watchdog            watchdog;
+static SafetyManager       safety;
+static MissionFsm          fsm;
+
+static SystemContext ctx;
+
+// TODO: replace with the shore/gateway board's real MAC (see interface contract).
+static uint8_t GATEWAY_MAC[6] = {0x24, 0x6F, 0x28, 0x00, 0x00, 0x01};
+
+void setup() {
+    Serial.begin(115200);
+    delay(200);
+    Serial.println(F("[USV] boot"));
+
+    // --- Buses ---
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+    // --- Peripherals ---
+    water.begin();
+    battery.begin();
+    compass.begin();
+    compass.setDeclination(0.0f);        // TODO: set local magnetic declination
+    gps.begin();
+    gps.configureSeaMode();
+    motor.begin();
+    logger.begin();
+
+    // --- Safety first ---
+    watchdog.begin(WATCHDOG_TIMEOUT_S);
+
+    // --- Comms ---
+    if (!commsLink.begin(ESPNOW_WIFI_CHANNEL, GATEWAY_MAC)) {
+        Serial.println(F("[USV] ESP-NOW init FAILED"));
+    }
+
+    fsm.begin();
+
+    // --- Shared IPC ---
+    ctx.water = &water;   ctx.battery = &battery; ctx.compass = &compass;
+    ctx.gps = &gps;       ctx.motor = &motor;     ctx.heading = &heading;
+    ctx.spiral = &spiral; ctx.ellipse = &ellipse; ctx.nav = &nav;
+    ctx.spiralPlanner = &spiralPlanner; ctx.anomaly = &anomaly;
+    ctx.link = &commsLink;ctx.logger = &logger;   ctx.wdt = &watchdog;
+    ctx.safety = &safety; ctx.fsm = &fsm;
+
+    ctx.logQueue   = xQueueCreate(16, sizeof(TelemetryPacket));
+    ctx.stateMutex = xSemaphoreCreateMutex();
+    memset(&ctx.snapshot, 0, sizeof(ctx.snapshot));
+    memset(&ctx.command,  0, sizeof(ctx.command));
+
+    // --- Tasks: Core 1 = navigation/control, Core 0 = IO ---
+    xTaskCreatePinnedToCore(navigationTask, "nav", 8192, &ctx, 3, nullptr, 1);
+    xTaskCreatePinnedToCore(ioTask,         "io",  8192, &ctx, 2, nullptr, 0);
+
+    Serial.println(F("[USV] tasks started"));
+}
+
+void loop() {
+    // All work runs in the pinned FreeRTOS tasks.
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\actuators\MotorDriver.cpp =====
+#include "MotorDriver.h"
+#include "config.h"
+
+void MotorDriver::begin() {
+    // Arduino-ESP32 core 2.x requires ledcSetup and ledcAttachPin.
+    ledcSetup(LEFT_LEDC_CH_IN1,  MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+    ledcAttachPin(LEFT_MOTOR_IN1, LEFT_LEDC_CH_IN1);
+    ledcSetup(LEFT_LEDC_CH_IN2,  MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+    ledcAttachPin(LEFT_MOTOR_IN2, LEFT_LEDC_CH_IN2);
+    ledcSetup(RIGHT_LEDC_CH_IN3, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+    ledcAttachPin(RIGHT_MOTOR_IN3, RIGHT_LEDC_CH_IN3);
+    ledcSetup(RIGHT_LEDC_CH_IN4, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+    ledcAttachPin(RIGHT_MOTOR_IN4, RIGHT_LEDC_CH_IN4);
+    stop();
+}
+
+void MotorDriver::driveSide(int pwm, uint8_t fwdChannel, uint8_t revChannel) {
+    if (pwm >= 0) {
+        ledcWrite(fwdChannel, pwm);
+        ledcWrite(revChannel, 0);
+    } else {
+        ledcWrite(fwdChannel, 0);
+        ledcWrite(revChannel, -pwm);
+    }
+}
+
+void MotorDriver::writeThrust(int leftPwm, int rightPwm) {
+    leftPwm  = constrain(leftPwm,  -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
+    rightPwm = constrain(rightPwm, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
+    driveSide(leftPwm,  LEFT_LEDC_CH_IN1,  LEFT_LEDC_CH_IN2);
+    driveSide(rightPwm, RIGHT_LEDC_CH_IN3, RIGHT_LEDC_CH_IN4);
+}
+
+int MotorDriver::forceToPwm(float forceN, float maxThrustN) {
+    if (maxThrustN <= 0.0f) return 0;
+    float ratio = forceN / maxThrustN;                 // -1..1
+    ratio = constrain(ratio, -1.0f, 1.0f);
+    int pwm = (int)(ratio * MOTOR_PWM_LIMIT);
+    // Deadband compensation: below MOTOR_MIN_PWM the thruster does not move.
+    if (pwm > 0 && pwm < MOTOR_MIN_PWM) pwm = MOTOR_MIN_PWM;
+    if (pwm < 0 && pwm > -MOTOR_MIN_PWM) pwm = -MOTOR_MIN_PWM;
+    return pwm;
+}
+
+void MotorDriver::stop() {
+    ledcWrite(LEFT_LEDC_CH_IN1,  0);
+    ledcWrite(LEFT_LEDC_CH_IN2,  0);
+    ledcWrite(RIGHT_LEDC_CH_IN3, 0);
+    ledcWrite(RIGHT_LEDC_CH_IN4, 0);
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\comms\EspNowLink.cpp =====
+#include "EspNowLink.h"
+#include "config.h"
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+// ---------------------------------------------------------------------------
+// SHARED SECRETS â€” must be identical on the shore/gateway board.
+// TODO: replace these placeholders with the values agreed with the gateway.
+// ---------------------------------------------------------------------------
+static const uint8_t PMK_KEY[16] = {
+    'U','S','V','_','P','M','K','_','1','6','b','y','t','e','s','!'
+};
+static const uint8_t LMK_KEY[16] = {
+    'U','S','V','_','L','M','K','_','1','6','b','y','t','e','s','!'
+};
+
+// Static member definitions
+QueueHandle_t EspNowLink::commandQueue  = nullptr;
+QueueHandle_t EspNowLink::waypointQueue = nullptr;
+uint32_t      EspNowLink::droppedPackets = 0;
+uint8_t       EspNowLink::_peerMac[6]   = {0};
+uint32_t      EspNowLink::_txSequence   = 0;
+
+void EspNowLink::onDataRecv(const uint8_t* mac_addr,
+                            const uint8_t* data, int len) {
+    (void)mac_addr;
+    BaseType_t higherWoken = pdFALSE;
+
+    // Demux purely by wire length (contract-defined, static_assert'd sizes).
+    if (len == (int)sizeof(CommandPacket)) {
+        CommandPacket cmd;
+        memcpy(&cmd, data, sizeof(cmd));
+        if (commandQueue) {
+            xQueueSendFromISR(commandQueue, &cmd, &higherWoken);
+        }
+    } else if (len == (int)sizeof(WaypointArrayPacket)) {
+        WaypointArrayPacket wps;
+        memcpy(&wps, data, sizeof(wps));
+        if (waypointQueue) {
+            xQueueSendFromISR(waypointQueue, &wps, &higherWoken);
+        }
+    } else {
+        droppedPackets++;   // unknown/foreign packet size -> discard
+    }
+
+    if (higherWoken == pdTRUE) portYIELD_FROM_ISR();
+}
+
+bool EspNowLink::begin(uint8_t channel, const uint8_t peerMac[6]) {
+    memcpy(_peerMac, peerMac, 6);
+
+    commandQueue  = xQueueCreate(8, sizeof(CommandPacket));
+    waypointQueue = xQueueCreate(4, sizeof(WaypointArrayPacket));
+    if (!commandQueue || !waypointQueue) return false;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    // Lock a fixed channel so both ends always match (no scanning).
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+
+    // Long-range mode for extended over-water range (must match the gateway).
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
+                                       WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+
+    if (esp_now_init() != ESP_OK) return false;
+
+    esp_now_set_pmk(PMK_KEY);
+    esp_now_register_recv_cb(EspNowLink::onDataRecv);
+
+    esp_now_peer_info_t peer;
+    memset(&peer, 0, sizeof(peer));
+    memcpy(peer.peer_addr, _peerMac, 6);
+    peer.channel = channel;
+    peer.encrypt = true;
+    memcpy(peer.lmk, LMK_KEY, 16);
+    peer.ifidx = WIFI_IF_STA;
+
+    if (esp_now_add_peer(&peer) != ESP_OK) return false;
+    return true;
+}
+
+bool EspNowLink::sendTelemetry(TelemetryPacket& pkt) {
+    pkt.sequence_number = ++_txSequence;   // monotonic, replay protection
+    return esp_now_send(_peerMac, (const uint8_t*)&pkt, sizeof(pkt)) == ESP_OK;
+}
+
+bool EspNowLink::sendAck(const WaypointACKPacket& pkt) {
+    return esp_now_send(_peerMac, (const uint8_t*)&pkt, sizeof(pkt)) == ESP_OK;
+}
+
+bool EspNowLink::sendBatteryReport(const BatteryReportPacket& pkt) {
+    return esp_now_send(_peerMac, (const uint8_t*)&pkt, sizeof(pkt)) == ESP_OK;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\control\EllipseTracker.cpp =====
+#include "EllipseTracker.h"
+#include "config.h"
+#include <Arduino.h>
+
+float EllipseTracker::crossTrackError(float x, float y, float a, float b) {
+    if (a <= 0.0f || b <= 0.0f) return 0.0f;
+    return (x * x) / (a * a) + (y * y) / (b * b) - 1.0f;
+}
+
+void EllipseTracker::calculateEllipticalThrust(float x, float y, float a, float b,
+                                               int basePwm, int& leftPwm, int& rightPwm) {
+    float E = crossTrackError(x, y, a, b);
+
+    if (fabs(E) < 0.01f) {          // on track: straight cruise
+        leftPwm  = basePwm;
+        rightPwm = basePwm;
+        return;
+    }
+
+    // E > 0 : outside ellipse -> steer inward; E < 0 : inside -> steer outward.
+    int correction = (int)(_gain * E);
+    correction = constrain(correction, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
+
+    leftPwm  = constrain(basePwm + correction, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
+    rightPwm = constrain(basePwm - correction, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\control\HeadingController.cpp =====
+#include "HeadingController.h"
+#include "config.h"
+#include <Arduino.h>
+
+HeadingController::HeadingController(float kp, float ki, float kd)
+    // Correction limited to full PWM span so a hard turn can reverse one side.
+    : _pid(kp, ki, kd, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT, PID_DERIV_ALPHA) {}
+
+float HeadingController::computeHeadingError(float targetDeg, float currentDeg) {
+    float error = targetDeg - currentDeg;
+    while (error > 180.0f)  error -= 360.0f;
+    while (error < -180.0f) error += 360.0f;
+    return error;
+}
+
+void HeadingController::calculateThrusterOutputs(float targetBearing, float currentHeading,
+                                                 int basePwm, float dt,
+                                                 int& leftPwm, int& rightPwm) {
+    float error = computeHeadingError(targetBearing, currentHeading);
+    float correction = _pid.update(error, dt);
+
+    leftPwm  = basePwm + (int)correction;
+    rightPwm = basePwm - (int)correction;
+
+    leftPwm  = constrain(leftPwm,  -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
+    rightPwm = constrain(rightPwm, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\control\PidController.cpp =====
+#include "PidController.h"
+
+PidController::PidController(float kp, float ki, float kd,
+                             float outMin, float outMax, float derivAlpha)
+    : _kp(kp), _ki(ki), _kd(kd),
+      _outMin(outMin), _outMax(outMax),
+      _alpha(derivAlpha),
+      _integral(0.0f), _prevError(0.0f), _prevDeriv(0.0f),
+      _hasPrev(false) {}
+
+void PidController::setTunings(float kp, float ki, float kd) {
+    _kp = kp; _ki = ki; _kd = kd;
+}
+
+void PidController::reset() {
+    _integral  = 0.0f;
+    _prevError = 0.0f;
+    _prevDeriv = 0.0f;
+    _hasPrev   = false;
+}
+
+float PidController::update(float error, float dt) {
+    if (dt <= 0.0f) dt = 1e-3f;
+
+    // --- Derivative on error with first-order low-pass filter ---
+    float rawDeriv = _hasPrev ? (error - _prevError) / dt : 0.0f;
+    float deriv    = _alpha * rawDeriv + (1.0f - _alpha) * _prevDeriv;
+
+    // --- Tentative integral ---
+    _integral += error * dt;
+
+    float output = _kp * error + _ki * _integral + _kd * deriv;
+
+    // --- Clamping anti-windup: if saturated, undo the integral step ---
+    if (output > _outMax) {
+        output = _outMax;
+        _integral -= error * dt;
+    } else if (output < _outMin) {
+        output = _outMin;
+        _integral -= error * dt;
+    }
+
+    _prevError = error;
+    _prevDeriv = deriv;
+    _hasPrev   = true;
+    return output;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\control\SpiralController.cpp =====
+#include "SpiralController.h"
+#include "config.h"
+#include <math.h>
+
+static inline double sgn(double x) {
+    return (x > 0.0) - (x < 0.0);
+}
+
+static inline double wrapPi(double a) {
+    while (a >  M_PI) a -= 2.0 * M_PI;
+    while (a < -M_PI) a += 2.0 * M_PI;
+    return a;
+}
+
+SpiralController::SpiralController(double halfBeam, double maxThrust, double losLookahead)
+    : _m_u(25.0), _m_r(8.0),
+      _d_u(12.0), _d_r(6.0),
+      _B_half(halfBeam),
+      _Tmax(maxThrust),
+      _losLookahead(losLookahead),
+      _k1_u(6.0), _k2_u(4.0),
+      _k1_r(5.0), _k2_r(3.0),
+      _sigma_u_int(0.0), _sigma_r_int(0.0) {}
+
+void SpiralController::reset() {
+    _sigma_u_int = 0.0;
+    _sigma_r_int = 0.0;
+}
+
+int SpiralController::forceToPwm(double force) const {
+    double ratio = force / _Tmax;
+    if (ratio >  1.0) ratio =  1.0;
+    if (ratio < -1.0) ratio = -1.0;
+    int pwm = (int)(ratio * MOTOR_PWM_LIMIT);
+    if (pwm > 0 && pwm < MOTOR_MIN_PWM)  pwm = MOTOR_MIN_PWM;
+    if (pwm < 0 && pwm > -MOTOR_MIN_PWM) pwm = -MOTOR_MIN_PWM;
+    return pwm;
+}
+
+ControlOutput SpiralController::computeControlInputs(const UsvState& s,
+                                                     const UsvTarget& t, double dt) {
+    if (dt <= 0.0) dt = 1e-3;
+    ControlOutput out;
+
+    // --- LOS guidance: desired heading toward the (look-ahead) reference ---
+    double dx = t.x_ref - s.x;
+    double dy = t.y_ref - s.y;
+    double psi_d = atan2(dy, dx);
+
+    // --- Sliding surfaces ---
+    double e_u = s.u - t.u_d;                 // surge speed error
+    double e_psi = wrapPi(s.psi - psi_d);     // heading error
+    double sigma_u = e_u;
+    double sigma_r = s.r + 1.5 * e_psi;       // yaw sliding surface (rate + heading)
+
+    // --- Super-twisting algorithm (surge channel) ---
+    _sigma_u_int += _k2_u * sgn(sigma_u) * dt;
+    double stsmc_u = -_k1_u * sqrt(fabs(sigma_u)) * sgn(sigma_u) - _sigma_u_int;
+
+    // --- Super-twisting algorithm (yaw channel) ---
+    _sigma_r_int += _k2_r * sgn(sigma_r) * dt;
+    double stsmc_r = -_k1_r * sqrt(fabs(sigma_r)) * sgn(sigma_r) - _sigma_r_int;
+
+    // --- Model-based equivalent control + STSMC robustifying term ---
+    out.tau_u = _d_u * s.u + _m_u * stsmc_u;
+    out.tau_r = _d_r * s.r + _m_r * stsmc_r;
+
+    // --- Actuator allocation (differential thrust) ---
+    // tau_u = T_port + T_stbd ; tau_r = (T_stbd - T_port) * B_half
+    double diff = (2.0 * _B_half > 0.0) ? out.tau_r / (2.0 * _B_half) : 0.0;
+    out.T_port = 0.5 * out.tau_u - diff;
+    out.T_stbd = 0.5 * out.tau_u + diff;
+
+    // --- Thrust saturation ---
+    if (out.T_port >  _Tmax) out.T_port =  _Tmax;
+    if (out.T_port < -_Tmax) out.T_port = -_Tmax;
+    if (out.T_stbd >  _Tmax) out.T_stbd =  _Tmax;
+    if (out.T_stbd < -_Tmax) out.T_stbd = -_Tmax;
+
+    out.pwm_port = forceToPwm(out.T_port);
+    out.pwm_stbd = forceToPwm(out.T_stbd);
+    return out;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\core\MissionFsm.cpp =====
+#include "MissionFsm.h"
+
+MissionFsm::MissionFsm() : _state(STATE_STANDBY) {}
+
+void MissionFsm::begin() { _state = STATE_STANDBY; }
+
+BoatState MissionFsm::tick(const FsmInputs& in) {
+    // --- Highest priority: emergency / critical safety from ANY state ---
+    if (in.emergencyCommand ||
+        in.safety == SafetyState::CRITICAL_STOP ||
+        in.safety == SafetyState::OVERCURRENT_STOP ||
+        in.safety == SafetyState::LEAK_STOP) {
+        _state = STATE_EMERGENCY_STOP;
+        return _state;
+    }
+
+    // --- Force RTH / low-battery RTH from any active state ---
+    if ((in.forceRthCommand || in.safety == SafetyState::LOW_BATTERY_RTH) &&
+        _state != STATE_STANDBY && _state != STATE_EMERGENCY_STOP) {
+        _state = STATE_RTH;
+        return _state;
+    }
+
+    // --- Normal transition table ---
+    switch (_state) {
+        case STATE_STANDBY:
+            if (in.startCommand) _state = STATE_GRID_PATROL;
+            break;
+
+        case STATE_GRID_PATROL:
+            if (in.anomalyDetected)   _state = STATE_SPIRAL_MAPPING;
+            else if (in.gridComplete) _state = STATE_RTH;
+            break;
+
+        case STATE_SPIRAL_MAPPING:
+            if (in.spiralComplete) _state = STATE_GRID_PATROL;  // resume patrol
+            break;
+
+        case STATE_RTH:
+            if (in.arrivedHome) _state = STATE_STANDBY;
+            break;
+
+        case STATE_EMERGENCY_STOP:
+            // Latching: only a fresh START from a cleared state re-arms.
+            if (in.startCommand && in.safety == SafetyState::NORMAL)
+                _state = STATE_STANDBY;
+            break;
+    }
+    return _state;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\core\Tasks.cpp =====
+#include "core/Tasks.h"
+#include "config.h"
+#include <math.h>
+
+// Rough current estimate from commanded thrust (stand-in until an INA219/ACS712
+// reading is wired in). max ~ both thrusters at full throttle.
+static float estimateCurrentA(int leftPwm, int rightPwm) {
+    float frac = (fabsf((float)leftPwm) + fabsf((float)rightPwm)) / (2.0f * 255.0f);
+    return frac * 20.0f;   // ~20 A peak twin-motor draw
+}
+
+// Home position captured when the mission first leaves STANDBY.
+static double g_homeLat = 0.0, g_homeLon = 0.0;
+static bool   g_homeSet = false;
+
+// ---------------------------------------------------------------------------
+// Core 1 â€” navigation & control loop
+// ---------------------------------------------------------------------------
+void navigationTask(void* pv) {
+    SystemContext* ctx = static_cast<SystemContext*>(pv);
+    ctx->wdt->subscribeCurrentTask();
+
+    BoatState prevState = STATE_STANDBY;
+    bool spiralDone = false;
+
+    TickType_t lastWake = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(NAV_LOOP_PERIOD_MS);
+    const float dt = NAV_LOOP_PERIOD_MS / 1000.0f;
+
+    for (;;) {
+        // ---- 1. Sensor acquisition ----
+        ctx->gps->update();
+        ctx->compass->update();
+        ctx->water->updateTemperatureNonBlocking();
+
+        GpsFix fix     = ctx->gps->getFilteredFix();
+        float  heading = ctx->compass->getHeadingDeg();
+        float  temp    = ctx->water->getWaterTemp();
+        float  ph      = ctx->water->readPh(temp);
+        float  turb    = ctx->water->readTurbidityNtu();
+        float  battV   = ctx->battery->readVoltage();
+
+        // ---- 2. Anomaly detection ----
+        bool anomaly = ctx->anomaly->updateReadings(ph, turb, temp, 12);
+
+        // ---- 3. Snapshot operator command ----
+        CommandState cmd;
+        if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            cmd = ctx->command;
+            xSemaphoreGive(ctx->stateMutex);
+        } else {
+            memset(&cmd, 0, sizeof(cmd));
+        }
+
+        // ---- 4. Safety evaluation ----
+        // Use the PREVIOUS loop's thrust to estimate current, breaking the
+        // safety -> FSM -> motor -> current circular dependency.
+        static int prevLeft = 0, prevRight = 0;
+        float currentA = estimateCurrentA(prevLeft, prevRight);
+        ctx->battery->updateCoulombCounter(currentA * 1000.0f);
+        SafetyState safety = ctx->safety->evaluate(battV, currentA, /*leak=*/false);
+
+        // ---- 5. Mission FSM ----
+        FsmInputs in;
+        in.startCommand     = cmd.start;
+        in.emergencyCommand = cmd.emergency;
+        in.forceRthCommand  = cmd.forceRth;
+        in.anomalyDetected  = anomaly;
+        in.spiralComplete   = spiralDone;
+        in.gridComplete     = ctx->nav->missionComplete();
+        in.arrivedHome      = g_homeSet && fix.valid &&
+            (Navigator::calculateDistance(fix.lat, fix.lon, g_homeLat, g_homeLon)
+                 <= WAYPOINT_RADIUS_M);
+        in.safety           = safety;
+
+        BoatState state = ctx->fsm->tick(in);
+
+        // Capture home the first time we start moving.
+        if (state != STATE_STANDBY && !g_homeSet && fix.valid) {
+            g_homeLat = fix.lat; g_homeLon = fix.lon; g_homeSet = true;
+        }
+        // Initialise the spiral generator on entry.
+        if (state == STATE_SPIRAL_MAPPING && prevState != STATE_SPIRAL_MAPPING) {
+            if (fix.valid) ctx->spiralPlanner->begin(fix.lat, fix.lon);
+            spiralDone = false;
+        }
+        if (state != STATE_SPIRAL_MAPPING) spiralDone = false;
+
+        // ---- 6. Act on state ----
+        int leftPwm = 0, rightPwm = 0;
+        switch (state) {
+            case STATE_STANDBY:
+            case STATE_EMERGENCY_STOP:
+                ctx->motor->stop();
+                ctx->heading->reset();
+                break;
+
+            case STATE_GRID_PATROL: {
+                if (cmd.manualMode) {
+                    leftPwm  = cmd.manualSpeed + cmd.manualSteer;
+                    rightPwm = cmd.manualSpeed - cmd.manualSteer;
+                } else if (ctx->nav->hasWaypoints() && fix.valid) {
+                    Waypoint tgt = ctx->nav->currentTarget();
+                    if (ctx->nav->isWaypointReached(fix.lat, fix.lon, WAYPOINT_RADIUS_M))
+                        ctx->nav->advanceWaypoint();
+                    float bearing = Navigator::calculateBearing(fix.lat, fix.lon,
+                                                                tgt.lat, tgt.lon);
+                    ctx->heading->calculateThrusterOutputs(bearing, heading,
+                                                           MOTOR_CRUISE_PWM, dt,
+                                                           leftPwm, rightPwm);
+                }
+                ctx->motor->writeThrust(leftPwm, rightPwm);
+                break;
+            }
+
+            case STATE_SPIRAL_MAPPING: {
+                static Waypoint spiralTgt = {0, 0};
+                static bool haveTgt = false;
+                if (!haveTgt || (fix.valid &&
+                        Navigator::calculateDistance(fix.lat, fix.lon,
+                            spiralTgt.lat, spiralTgt.lon) <= WAYPOINT_RADIUS_M)) {
+                    haveTgt = ctx->spiralPlanner->nextSpiralPoint(spiralTgt);
+                    if (!haveTgt) spiralDone = true;
+                }
+                if (haveTgt && fix.valid) {
+                    float bearing = Navigator::calculateBearing(fix.lat, fix.lon,
+                                                                spiralTgt.lat, spiralTgt.lon);
+                    ctx->heading->calculateThrusterOutputs(bearing, heading,
+                                                           MOTOR_MIN_PWM + 30, dt,
+                                                           leftPwm, rightPwm);
+                }
+                ctx->motor->writeThrust(leftPwm, rightPwm);
+                break;
+            }
+
+            case STATE_RTH: {
+                if (g_homeSet && fix.valid) {
+                    float bearing = Navigator::calculateBearing(fix.lat, fix.lon,
+                                                                g_homeLat, g_homeLon);
+                    ctx->heading->calculateThrusterOutputs(bearing, heading,
+                                                           MOTOR_CRUISE_PWM, dt,
+                                                           leftPwm, rightPwm);
+                }
+                ctx->motor->writeThrust(leftPwm, rightPwm);
+                break;
+            }
+        }
+
+        // GPS safe-float: if fix is stale, stop motors regardless of state.
+        GpsLossTier tier = ctx->gps->getLossTier();
+        if (tier == GpsLossTier::SAFE_FLOAT || tier == GpsLossTier::EMERGENCY_RTH) {
+            ctx->motor->stop();
+        }
+
+        // ---- 7. Publish telemetry snapshot ----
+        if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            ctx->snapshot.gps_lat         = fix.lat;
+            ctx->snapshot.gps_lon         = fix.lon;
+            ctx->snapshot.water_ph        = ph;
+            ctx->snapshot.water_turbidity = turb;
+            ctx->snapshot.water_temp      = temp;
+            ctx->snapshot.current_mode    = (uint8_t)state;
+            ctx->snapshot.battery_percent = ctx->battery->getBatteryPercent();
+            ctx->snapshot.heading_angle   = heading;
+            xSemaphoreGive(ctx->stateMutex);
+        }
+
+        // ---- 8. Log (non-blocking hand-off to IO task) ----
+        TelemetryPacket logRec = ctx->snapshot;
+        xQueueSend(ctx->logQueue, &logRec, 0);
+
+        prevLeft = leftPwm; prevRight = rightPwm;
+        prevState = state;
+        ctx->wdt->feed();
+        vTaskDelayUntil(&lastWake, period);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core 0 â€” comms & storage
+// ---------------------------------------------------------------------------
+void ioTask(void* pv) {
+    SystemContext* ctx = static_cast<SystemContext*>(pv);
+    ctx->wdt->subscribeCurrentTask();
+
+    unsigned long lastTelemetry = 0;
+
+    for (;;) {
+        // ---- Drain inbound command queue ----
+        CommandPacket cmdPkt;
+        while (xQueueReceive(EspNowLink::commandQueue, &cmdPkt, 0) == pdTRUE) {
+            if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                ctx->command.emergency = (cmdPkt.sys_command == CMD_EMERGENCY_STOP);
+                ctx->command.forceRth  = (cmdPkt.sys_command == CMD_FORCE_RTH);
+                if (cmdPkt.manual_speed != 0 || cmdPkt.manual_steer != 0) {
+                    ctx->command.manualMode  = true;
+                    ctx->command.manualSpeed = cmdPkt.manual_speed;
+                    ctx->command.manualSteer = cmdPkt.manual_steer;
+                } else {
+                    ctx->command.manualMode = false;
+                }
+                xSemaphoreGive(ctx->stateMutex);
+            }
+        }
+
+        // ---- Drain inbound waypoint queue (+ ACK) ----
+        WaypointArrayPacket wps;
+        while (xQueueReceive(EspNowLink::waypointQueue, &wps, 0) == pdTRUE) {
+            bool ok = (wps.packet_index == 0) ? (ctx->nav->loadWaypoints(wps), true)
+                                              : ctx->nav->appendBatch(wps);
+            WaypointACKPacket ack;
+            ack.packet_index = wps.packet_index;
+            ack.ack_status   = ok ? ACK_OK : ACK_NACK;
+            ctx->link->sendAck(ack);
+
+            // Receiving a mission implicitly arms START.
+            if (ok && xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                ctx->command.start = true;
+                xSemaphoreGive(ctx->stateMutex);
+            }
+        }
+
+        // ---- Periodic telemetry TX ----
+        if (millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
+            TelemetryPacket tp;
+            if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                tp = ctx->snapshot;
+                xSemaphoreGive(ctx->stateMutex);
+                ctx->link->sendTelemetry(tp);   // stamps sequence_number
+            }
+            lastTelemetry = millis();
+        }
+
+        // ---- Drain log queue to SD ----
+        TelemetryPacket logRec;
+        while (xQueueReceive(ctx->logQueue, &logRec, 0) == pdTRUE) {
+            ctx->logger->logRecord(logRec);
+        }
+
+        ctx->wdt->feed();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\detection\WaterAnomalyMonitor.cpp =====
+#include "WaterAnomalyMonitor.h"
+#include "config.h"
+#include <math.h>
+
+WaterAnomalyMonitor::WaterAnomalyMonitor()
+    : _bufIdx(0), _bufCount(0),
+      _turbBaselineEma(0.0f), _lastTurb(0.0f),
+      _lastSampleTime(millis()),      // fix: init in ctor, not at first sample
+      _triggerSpiral(false), _anomalyScore(0.0f), _turbRoc(0.0f) {
+    for (int i = 0; i < SMA_WINDOW; i++) { _phBuf[i] = 7.0f; _turbBuf[i] = 0.0f; }
+}
+
+float WaterAnomalyMonitor::sma(const float* buf) const {
+    int n = _bufCount < SMA_WINDOW ? _bufCount : SMA_WINDOW;
+    if (n == 0) return buf[0];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += buf[i];
+    return sum / n;
+}
+
+float WaterAnomalyMonitor::phHighLimitForHour(int hour) const {
+    // Daytime photosynthesis raises pH; allow a higher ceiling 12:00-17:00.
+    if (hour >= 12 && hour < 17) return PH_HIGH_LIMIT_DAY;   // 9.2
+    return PH_HIGH_LIMIT_NIGHT;                              // 8.8
+}
+
+float WaterAnomalyMonitor::calculateAmmoniaToxicity(float ph, float temp) {
+    // Fraction of un-ionized NH3 = 1 / (1 + 10^(pKa - pH)).
+    float pKa = 0.09018f + 2729.92f / (temp + 273.15f);
+    float fraction = 1.0f / (1.0f + powf(10.0f, pKa - ph));
+    return fraction;   // 0..1
+}
+
+bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp, int hour) {
+    unsigned long now = millis();
+    float dtMin = (now - _lastSampleTime) / 60000.0f;   // minutes
+    _lastSampleTime = now;
+
+    // --- Ring-buffer for SMA smoothing ---
+    _phBuf[_bufIdx]   = ph;
+    _turbBuf[_bufIdx] = turbidity;
+    _bufIdx = (_bufIdx + 1) % SMA_WINDOW;
+    if (_bufCount < SMA_WINDOW) _bufCount++;
+
+    float phAvg   = sma(_phBuf);
+    float turbAvg = sma(_turbBuf);
+
+    // --- Turbidity rate-of-change (NTU per minute) ---
+    if (dtMin > 1e-4f && dtMin < 10.0f) {
+        _turbRoc = (turbidity - _lastTurb) / dtMin;
+    } else {
+        _turbRoc = 0.0f;
+    }
+    _lastTurb = turbidity;
+
+    // --- EMA baseline (slow) + deviation ---
+    if (_turbBaselineEma <= 0.0f) _turbBaselineEma = turbAvg;
+    _turbBaselineEma = 0.98f * _turbBaselineEma + 0.02f * turbAvg;
+    float baselineDev = turbAvg - _turbBaselineEma;
+
+    // --- Individual anomaly conditions (Decision #5 unified OR rule) ---
+    float phHigh = phHighLimitForHour(hour);
+    bool phOut   = (phAvg < PH_LOW_LIMIT) || (phAvg > phHigh);
+    bool turbHigh = (turbAvg > TURBIDITY_WASTEWATER_NTU);
+    bool turbSpike = (_turbRoc > TURBIDITY_ROC_LIMIT);
+    float toxicity = calculateAmmoniaToxicity(phAvg, temp);
+    bool ammoniaBad = (toxicity > AMMONIA_TOXICITY_LIMIT);
+
+    // --- Continuous anomaly score (0..1-ish) for telemetry / tuning ---
+    float score = 0.0f;
+    if (turbAvg > TURBIDITY_WARNING_NTU)
+        score += (turbAvg - TURBIDITY_WARNING_NTU) /
+                 (TURBIDITY_WASTEWATER_NTU - TURBIDITY_WARNING_NTU) * 0.4f;
+    if (baselineDev > 0.0f) score += fminf(baselineDev / 50.0f, 0.3f);
+    if (phOut)      score += 0.3f;
+    if (ammoniaBad) score += 0.4f;
+    if (turbSpike)  score += 0.3f;
+    _anomalyScore = fminf(score, 1.5f);
+
+    _triggerSpiral = turbHigh || turbSpike || phOut || ammoniaBad;
+    return _triggerSpiral;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\navigation\Navigator.cpp =====
+#include "Navigator.h"
+#include <math.h>
+
+static const double EARTH_RADIUS_M = 6371000.0;
+static const double DEG2RAD = M_PI / 180.0;
+static const double RAD2DEG = 180.0 / M_PI;
+
+Navigator::Navigator() : _count(0), _index(0) {}
+
+double Navigator::calculateDistance(double lat1, double lon1,
+                                    double lat2, double lon2) {
+    double dLat = (lat2 - lat1) * DEG2RAD;
+    double dLon = (lon2 - lon1) * DEG2RAD;
+    double a = sin(dLat / 2.0) * sin(dLat / 2.0) +
+               cos(lat1 * DEG2RAD) * cos(lat2 * DEG2RAD) *
+               sin(dLon / 2.0) * sin(dLon / 2.0);
+    double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+    return EARTH_RADIUS_M * c;
+}
+
+double Navigator::calculateBearing(double lat1, double lon1,
+                                   double lat2, double lon2) {
+    double phi1 = lat1 * DEG2RAD;
+    double phi2 = lat2 * DEG2RAD;
+    double dLon = (lon2 - lon1) * DEG2RAD;
+    double y = sin(dLon) * cos(phi2);
+    double x = cos(phi1) * sin(phi2) - sin(phi1) * cos(phi2) * cos(dLon);
+    double bearing = atan2(y, x) * RAD2DEG;
+    if (bearing < 0.0) bearing += 360.0;
+    return bearing;
+}
+
+void Navigator::clear() {
+    _count = 0;
+    _index = 0;
+}
+
+void Navigator::loadWaypoints(const WaypointArrayPacket& pkt) {
+    clear();
+    appendBatch(pkt);
+}
+
+bool Navigator::appendBatch(const WaypointArrayPacket& pkt) {
+    uint8_t n = pkt.waypoint_count;
+    if (n > 12) n = 12;
+    for (uint8_t i = 0; i < n; i++) {
+        if (_count >= MAX_WAYPOINTS) return false;   // overflow guard
+        _wps[_count++] = pkt.waypoints[i];
+    }
+    return true;
+}
+
+Waypoint Navigator::currentTarget() const {
+    if (_index < _count) return _wps[_index];
+    Waypoint empty = {0.0, 0.0};
+    return empty;
+}
+
+bool Navigator::isWaypointReached(double lat, double lon, double radiusM) const {
+    if (_index >= _count) return false;
+    double d = calculateDistance(lat, lon, _wps[_index].lat, _wps[_index].lon);
+    return d <= radiusM;
+}
+
+void Navigator::advanceWaypoint() {
+    if (_index < _count) _index++;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\navigation\SpiralPlanner.cpp =====
+#include "SpiralPlanner.h"
+#include "config.h"
+#include <math.h>
+
+static const double DEG2RAD_SP = M_PI / 180.0;
+static const double METERS_PER_DEG_LAT = 111320.0;
+
+SpiralPlanner::SpiralPlanner()
+    : _centerLat(0.0), _centerLon(0.0), _theta(0.0), _complete(false) {}
+
+void SpiralPlanner::begin(double centerLat, double centerLon) {
+    _centerLat = centerLat;
+    _centerLon = centerLon;
+    _theta     = 0.0;
+    _complete  = false;
+}
+
+void SpiralPlanner::reset() {
+    _theta    = 0.0;
+    _complete = false;
+}
+
+Waypoint SpiralPlanner::calculateSpiralOffset(double centerLat, double centerLon,
+                                              double radiusM, double thetaRad) {
+    double dxEast  = radiusM * cos(thetaRad);   // meters east
+    double dyNorth = radiusM * sin(thetaRad);   // meters north
+
+    double dLat = dyNorth / METERS_PER_DEG_LAT;
+    double dLon = dxEast / (METERS_PER_DEG_LAT * cos(centerLat * DEG2RAD_SP));
+
+    Waypoint wp;
+    wp.lat = centerLat + dLat;
+    wp.lon = centerLon + dLon;
+    return wp;
+}
+
+bool SpiralPlanner::nextSpiralPoint(Waypoint& out) {
+    if (_complete) return false;
+
+    double r = SPIRAL_A_M + SPIRAL_B_M * _theta;
+    if (r > SPIRAL_MAX_RADIUS_M || _theta > SPIRAL_MAX_THETA) {
+        _complete = true;
+        return false;
+    }
+
+    out = calculateSpiralOffset(_centerLat, _centerLon, r, _theta);
+    _theta += SPIRAL_DTHETA;
+    return true;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\safety\SafetyManager.cpp =====
+#include "SafetyManager.h"
+#include "config.h"
+
+static const unsigned long OVERCURRENT_DEBOUNCE_MS = 500;
+
+SafetyManager::SafetyManager()
+    : _state(SafetyState::NORMAL), _overcurrentSince(0) {}
+
+SafetyState SafetyManager::evaluate(float batteryV, float currentA, bool leak) {
+    // Evaluate from most to least severe; first match wins.
+
+    // 1) Critical battery -> hard stop (latching, most severe).
+    if (batteryV <= VOLTAGE_CRITICAL) {
+        _state = SafetyState::CRITICAL_STOP;
+        return _state;
+    }
+
+    // 2) Hull leak -> stop.
+    if (leak) {
+        _state = SafetyState::LEAK_STOP;
+        return _state;
+    }
+
+    // 3) Overcurrent with debounce (ignore momentary inrush).
+    if (currentA >= OVERCURRENT_LIMIT_A) {
+        if (_overcurrentSince == 0) _overcurrentSince = millis();
+        if (millis() - _overcurrentSince >= OVERCURRENT_DEBOUNCE_MS) {
+            _state = SafetyState::OVERCURRENT_STOP;
+            return _state;
+        }
+    } else {
+        _overcurrentSince = 0;
+    }
+
+    // 4) Low battery -> return home (with small hysteresis to avoid chatter).
+    if (batteryV <= VOLTAGE_RTH) {
+        _state = SafetyState::LOW_BATTERY_RTH;
+        return _state;
+    }
+    if (_state == SafetyState::LOW_BATTERY_RTH && batteryV < VOLTAGE_RTH + 0.2f) {
+        return _state;   // stay in RTH until recovered above threshold+hysteresis
+    }
+
+    _state = SafetyState::NORMAL;
+    return _state;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\safety\Watchdog.cpp =====
+#include "Watchdog.h"
+#include <esp_task_wdt.h>
+
+void Watchdog::begin(uint32_t timeoutSec) {
+    // Arduino-ESP32 core 2.x uses esp_task_wdt_init directly.
+    esp_task_wdt_init(timeoutSec, true);
+    _initialised = true;
+}
+
+void Watchdog::subscribeCurrentTask() {
+    if (!_initialised) return;
+    esp_task_wdt_add(NULL);   // NULL = current task
+}
+
+void Watchdog::feed() {
+    esp_task_wdt_reset();
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\sensors\BatteryMonitor.cpp =====
+#include "BatteryMonitor.h"
+#include "config.h"
+
+BatteryMonitor::BatteryMonitor()
+    : _totalCapacity_mAh(BATTERY_CAPACITY_MAH),
+      _consumed_mAh(0.0f),
+      _lastSampleTime(0),
+      _currentAvg_mA(1000.0f),
+      _lastVoltage(VOLTAGE_FULL) {}
+
+void BatteryMonitor::begin() {
+    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);  // 0-3.1V usable range
+    // Initialise timer in begin() so first dt is not inflated (fix m-10).
+    _lastSampleTime = millis();
+}
+
+float BatteryMonitor::readVoltage() {
+    // analogReadMilliVolts applies the factory eFuse ADC calibration.
+    uint32_t mv = analogReadMilliVolts(BATTERY_ADC_PIN);
+    _lastVoltage = (mv / 1000.0f) * BATTERY_DIVIDER_RATIO;
+    return _lastVoltage;
+}
+
+void BatteryMonitor::updateCoulombCounter(float current_mA) {
+    unsigned long now = millis();
+    float dt = (now - _lastSampleTime) / 1000.0f;   // seconds
+    _lastSampleTime = now;
+
+    if (dt > 0.0f && dt < 10.0f) {                  // guard boot / stalls
+        _consumed_mAh += (current_mA * dt) / 3600.0f;
+    }
+    // Weighted moving average of current (smooths surge draw).
+    _currentAvg_mA = (_currentAvg_mA * 0.95f) + (current_mA * 0.05f);
+}
+
+float BatteryMonitor::getRemainingMinutes() {
+    float remaining = _totalCapacity_mAh - _consumed_mAh;
+    if (remaining < 0.0f) remaining = 0.0f;
+    if (_currentAvg_mA <= 10.0f) return 999.0f;     // idle: avoid div-by-zero
+    return (remaining / _currentAvg_mA) * 60.0f;
+}
+
+float BatteryMonitor::getSoCPercent(float voltage) {
+    if (voltage >= 12.6f) return 100.0f;
+    if (voltage <= 10.5f) return 0.0f;
+    if (voltage > 12.0f) return 80.0f + (voltage - 12.0f) * 33.3f; // 12.0-12.6
+    if (voltage > 11.5f) return 50.0f + (voltage - 11.5f) * 60.0f; // 11.5-12.0
+    if (voltage > 11.1f) return 20.0f + (voltage - 11.1f) * 75.0f; // 11.1-11.5
+    return (voltage - 10.5f) * 33.3f;                              // 10.5-11.1
+}
+
+uint8_t BatteryMonitor::getBatteryPercent() {
+    float soc = getSoCPercent(_lastVoltage);
+    if (soc < 0.0f)   soc = 0.0f;
+    if (soc > 100.0f) soc = 100.0f;
+    return (uint8_t)(soc + 0.5f);
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\sensors\Compass.cpp =====
+#include "Compass.h"
+#include "config.h"
+#include <Wire.h>
+#include <math.h>
+
+// QMC5883L register map
+static const uint8_t REG_DATA_X_LSB = 0x00;
+static const uint8_t REG_STATUS     = 0x06;
+static const uint8_t REG_CONTROL_1  = 0x09;
+static const uint8_t REG_SET_RESET  = 0x0B;
+
+Compass::Compass()
+    : _rawX(0), _rawY(0), _rawZ(0),
+      _offX(0), _offY(0), _offZ(0),
+      _scaleX(1.0f), _scaleY(1.0f), _scaleZ(1.0f),
+      _declination(0.0f) {}
+
+bool Compass::writeRegister(uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(QMC5883L_I2C_ADDR);
+    Wire.write(reg);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
+}
+
+bool Compass::begin() {
+    // Assumes Wire.begin(SDA, SCL) already called by the system init.
+    if (!writeRegister(REG_SET_RESET, 0x01)) return false;
+    // OSR=512, RNG=8G, ODR=200Hz, MODE=continuous  -> 0b0001 1101 = 0x1D
+    return writeRegister(REG_CONTROL_1, 0x1D);
+}
+
+void Compass::update() {
+    Wire.beginTransmission(QMC5883L_I2C_ADDR);
+    Wire.write(REG_DATA_X_LSB);
+    if (Wire.endTransmission(false) != 0) return;
+
+    if (Wire.requestFrom(QMC5883L_I2C_ADDR, 6) != 6) return;
+    _rawX = (int16_t)(Wire.read() | (Wire.read() << 8));
+    _rawY = (int16_t)(Wire.read() | (Wire.read() << 8));
+    _rawZ = (int16_t)(Wire.read() | (Wire.read() << 8));
+}
+
+void Compass::setHardIron(float x, float y, float z) { _offX = x; _offY = y; _offZ = z; }
+void Compass::setSoftIron(float sx, float sy, float sz) { _scaleX = sx; _scaleY = sy; _scaleZ = sz; }
+void Compass::setDeclination(float degrees) { _declination = degrees; }
+
+float Compass::applyDeclination(float headingDeg) {
+    float h = headingDeg + _declination;
+    while (h < 0.0f)    h += 360.0f;
+    while (h >= 360.0f) h -= 360.0f;
+    return h;
+}
+
+float Compass::getHeadingDeg() {
+    float x = (_rawX - _offX) * _scaleX;
+    float y = (_rawY - _offY) * _scaleY;
+
+    float heading = atan2f(y, x) * 180.0f / (float)M_PI;
+    if (heading < 0.0f) heading += 360.0f;
+    return applyDeclination(heading);
+}
+
+void Compass::runCalibration(unsigned long durationMs) {
+    int16_t minX = 32767, minY = 32767, maxX = -32768, maxY = -32768;
+    unsigned long start = millis();
+    while (millis() - start < durationMs) {
+        update();
+        if (_rawX < minX) minX = _rawX;
+        if (_rawX > maxX) maxX = _rawX;
+        if (_rawY < minY) minY = _rawY;
+        if (_rawY > maxY) maxY = _rawY;
+        delay(20);
+    }
+    _offX = (maxX + minX) / 2.0f;
+    _offY = (maxY + minY) / 2.0f;
+    float rangeX = (maxX - minX) / 2.0f;
+    float rangeY = (maxY - minY) / 2.0f;
+    float avgRange = (rangeX + rangeY) / 2.0f;
+    if (rangeX > 1.0f) _scaleX = avgRange / rangeX;
+    if (rangeY > 1.0f) _scaleY = avgRange / rangeY;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\sensors\GpsModule.cpp =====
+#include "GpsModule.h"
+#include "config.h"
+
+GpsModule::GpsModule()
+    : _filtLat(0.0), _filtLon(0.0),
+      _filterInit(false),
+      _lastValidFixMs(0) {}
+
+void GpsModule::begin() {
+    Serial2.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    _lastValidFixMs = millis();
+}
+
+void GpsModule::sendUbx(const uint8_t* msg, size_t len) {
+    for (size_t i = 0; i < len; i++) Serial2.write(msg[i]);
+    Serial2.flush();
+}
+
+void GpsModule::configureSeaMode() {
+    // UBX-CFG-NAV5: set dynamic platform model = 5 (Sea). Only dynModel masked.
+    uint8_t cfg[] = {
+        0xB5, 0x62, 0x06, 0x24, 0x24, 0x00,
+        0x01, 0x00,             // mask: apply dynModel only
+        0x05,                   // dynModel = Sea
+        0x03,                   // fixMode = auto 2D/3D
+        0x00, 0x00, 0x00, 0x00, // fixedAlt
+        0x10, 0x27, 0x00, 0x00, // fixedAltVar
+        0x05,                   // minElev
+        0x00,                   // drLimit
+        0xFA, 0x00,             // pDop
+        0xFA, 0x00,             // tDop
+        0x64, 0x00,             // pAcc
+        0x2C, 0x01,             // tAcc
+        0x00,                   // staticHoldThresh
+        0x00,                   // dgnssTimeout
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00              // checksum placeholder (computed below)
+    };
+    // Compute Fletcher checksum over class..payload (bytes 2..end-2).
+    uint8_t ckA = 0, ckB = 0;
+    for (size_t i = 2; i < sizeof(cfg) - 2; i++) {
+        ckA += cfg[i];
+        ckB += ckA;
+    }
+    cfg[sizeof(cfg) - 2] = ckA;
+    cfg[sizeof(cfg) - 1] = ckB;
+    sendUbx(cfg, sizeof(cfg));
+}
+
+bool GpsModule::update() {
+    bool gotSentence = false;
+    while (Serial2.available() > 0) {
+        if (_gps.encode(Serial2.read())) gotSentence = true;
+    }
+    if (gotSentence && isFixValid()) {
+        applyLowPassFilter(_gps.location.lat(), _gps.location.lng());
+        _lastValidFixMs = millis();
+    }
+    return gotSentence;
+}
+
+bool GpsModule::isFixValid() {
+    if (!_gps.location.isValid()) return false;
+    uint8_t sats = _gps.satellites.isValid() ? _gps.satellites.value() : 0;
+    float   hdop = _gps.hdop.isValid() ? _gps.hdop.hdop() : 99.0f;
+    return (sats >= GPS_MIN_SATS) && (hdop < GPS_MAX_HDOP);
+}
+
+void GpsModule::applyLowPassFilter(double lat, double lon) {
+    if (!_filterInit) {
+        _filtLat = lat;
+        _filtLon = lon;
+        _filterInit = true;
+        return;
+    }
+    _filtLat = GPS_FILTER_ALPHA * lat + (1.0f - GPS_FILTER_ALPHA) * _filtLat;
+    _filtLon = GPS_FILTER_ALPHA * lon + (1.0f - GPS_FILTER_ALPHA) * _filtLon;
+}
+
+GpsFix GpsModule::getFilteredFix() {
+    GpsFix fix;
+    fix.lat   = _filtLat;
+    fix.lon   = _filtLon;
+    fix.hdop  = _gps.hdop.isValid() ? _gps.hdop.hdop() : 99.0f;
+    fix.sats  = _gps.satellites.isValid() ? _gps.satellites.value() : 0;
+    fix.valid = _filterInit && (getLossTier() == GpsLossTier::NONE);
+    return fix;
+}
+
+unsigned long GpsModule::timeSinceFix() const {
+    return millis() - _lastValidFixMs;
+}
+
+GpsLossTier GpsModule::getLossTier() {
+    unsigned long elapsed = timeSinceFix();
+    if (elapsed < GPS_LOSS_T1_MS) return GpsLossTier::NONE;
+    if (elapsed < GPS_LOSS_T2_MS) return GpsLossTier::DEAD_RECKONING;
+    if (elapsed < 2 * GPS_LOSS_T2_MS) return GpsLossTier::SAFE_FLOAT;
+    return GpsLossTier::EMERGENCY_RTH;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\sensors\WaterSensors.cpp =====
+#include "WaterSensors.h"
+#include "config.h"
+
+static const int   TEMP_CONVERSION_MS = 750;  // DS18B20 12-bit conversion time
+static const uint8_t ADS_PH_CHANNEL   = 0;
+static const uint8_t ADS_TURB_CHANNEL = 1;
+
+WaterSensors::WaterSensors()
+    : _oneWire(TEMP_SENSOR_PIN),
+      _temp(&_oneWire),
+      _lastTempRequest(0),
+      _waterTemp(25.0f),
+      _adsReady(false) {}
+
+bool WaterSensors::begin() {
+    _adsReady = _ads.begin(ADS1115_I2C_ADDR);
+    if (_adsReady) {
+        // +/-6.144V range so the 0-5V sensor swing fits without clipping.
+        _ads.setGain(GAIN_TWOTHIRDS);
+    }
+
+    _temp.begin();
+    _temp.setWaitForConversion(false);   // non-blocking mode
+    _temp.requestTemperatures();
+    _lastTempRequest = millis();
+    return _adsReady;
+}
+
+float WaterSensors::readChannelVoltage(uint8_t channel) {
+    if (!_adsReady) return 0.0f;
+    int16_t raw = _ads.readADC_SingleEnded(channel);
+    return _ads.computeVolts(raw);
+}
+
+void WaterSensors::updateTemperatureNonBlocking() {
+    if (millis() - _lastTempRequest >= (unsigned long)TEMP_CONVERSION_MS) {
+        float t = _temp.getTempCByIndex(0);
+        if (t > -55.0f && t < 125.0f) {   // ignore DEVICE_DISCONNECTED_C etc.
+            _waterTemp = t;
+        }
+        _temp.requestTemperatures();      // kick off next conversion
+        _lastTempRequest = millis();
+    }
+}
+
+float WaterSensors::readPh(float tempC) {
+    float rawVoltage = readChannelVoltage(ADS_PH_CHANNEL);
+    // Nernst slope factor (V/pH) scaled by absolute temperature.
+    float slopeAtTemp   = 0.05916f * ((tempC + 273.15f) / 298.15f);
+    float neutralVoltage = 2.0f;   // pH 7.00 reference voltage assumption
+    float phValue = 7.0f + ((neutralVoltage - rawVoltage) / slopeAtTemp);
+    if (phValue < 0.0f)  phValue = 0.0f;
+    if (phValue > 14.0f) phValue = 14.0f;
+    return phValue;
+}
+
+float WaterSensors::readTurbidityNtu() {
+    float voltage = readChannelVoltage(ADS_TURB_CHANNEL);
+    if (voltage < 2.5f) return 3000.0f;  // very turbid
+    if (voltage > 4.2f) return 0.0f;     // clear water
+    float ntu = -1120.4f * (voltage * voltage) + 5742.3f * voltage - 4353.8f;
+    return ntu < 0.0f ? 0.0f : ntu;
+}
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\storage\DataLogger.cpp =====
+#include "DataLogger.h"
+#include "config.h"
+#include <SPI.h>
+#include <SD.h>
+
+// Single logger instance -> keep the open file handle at file scope so the
+// header need not pull in <SD.h>.
+static File     g_logFile;
+static SPIClass g_spi(HSPI);
+
+static const char* CSV_HEADER =
+    "seq,lat,lon,ph,turbidity,temp,mode,battery,heading\n";
+
+DataLogger::DataLogger()
+    : _spiMutex(nullptr), _ready(false), _lastFlush(0) {
+    strncpy(_filename, "/mission_log.csv", sizeof(_filename));
+    _filename[sizeof(_filename) - 1] = '\0';
+}
+
+void DataLogger::openAndWriteHeader() {
+    bool isNew = !SD.exists(_filename);
+    g_logFile = SD.open(_filename, FILE_APPEND);
+    if (g_logFile && isNew) {
+        g_logFile.print(CSV_HEADER);
+        g_logFile.flush();
+    }
+}
+
+bool DataLogger::begin() {
+    _spiMutex = xSemaphoreCreateMutex();
+    if (!_spiMutex) return false;
+
+    g_spi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+    if (!SD.begin(SD_CS_PIN, g_spi)) {
+        _ready = false;
+        return false;
+    }
+    openAndWriteHeader();
+    _ready = (bool)g_logFile;
+    _lastFlush = millis();
+    return _ready;
+}
+
+void DataLogger::logRecord(const TelemetryPacket& pkt) {
+    if (!_ready) return;
+    if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+
+    if (g_logFile) {
+        g_logFile.printf("%lu,%.6f,%.6f,%.2f,%.1f,%.2f,%u,%u,%.1f\n",
+                         (unsigned long)pkt.sequence_number,
+                         pkt.gps_lat, pkt.gps_lon,
+                         pkt.water_ph, pkt.water_turbidity, pkt.water_temp,
+                         pkt.current_mode, pkt.battery_percent,
+                         pkt.heading_angle);
+
+        // Flush at most once per second to bound loss without thrashing SD.
+        if (millis() - _lastFlush >= 1000) {
+            g_logFile.flush();
+            _lastFlush = millis();
+        }
+    }
+    xSemaphoreGive(_spiMutex);
+}
+
+bool DataLogger::checkIntegrity() {
+    if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
+    bool ok = (SD.cardType() != CARD_NONE) && (bool)g_logFile;
+    xSemaphoreGive(_spiMutex);
+    return ok;
+}

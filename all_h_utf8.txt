@@ -1,0 +1,692 @@
+﻿===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\actuators\MotorDriver.h =====
+#ifndef USV_MOTOR_DRIVER_H
+#define USV_MOTOR_DRIVER_H
+
+#include <Arduino.h>
+
+// Dual BTS7960 H-bridges driving two thrusters. Uses ESP32 LEDC at 20 kHz,
+// 8-bit resolution. Signed PWM: positive = forward, negative = reverse.
+// See USV_Power_Management_Guide.md and USV_Hardware_GPIO_Mapping.md.
+class MotorDriver {
+public:
+    void begin();
+
+    // leftPwm / rightPwm in [-255, 255]; internally capped to MOTOR_PWM_LIMIT.
+    void writeThrust(int leftPwm, int rightPwm);
+
+    // Map a commanded thrust force (N) to an 8-bit PWM magnitude.
+    int  forceToPwm(float forceN, float maxThrustN);
+
+    void stop();
+
+private:
+    void driveSide(int pwm, uint8_t fwdChannel, uint8_t revChannel);
+};
+
+#endif // USV_MOTOR_DRIVER_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\comms\EspNowLink.h =====
+#ifndef USV_ESPNOW_LINK_H
+#define USV_ESPNOW_LINK_H
+
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include "Packets.h"
+
+// Boat-side half of the ESP-NOW Interface Contract (see plan section 10).
+// - locks the Wi-Fi channel + enables long-range (LR) mode
+// - registers a single encrypted peer (the shore gateway)
+// - RX callback demuxes inbound packets by size into FreeRTOS queues
+// - TX helpers stamp/emit telemetry (seq++) and waypoint ACKs
+//
+// The gateway (friend's project) MUST mirror this contract; we do NOT code it.
+class EspNowLink {
+public:
+    bool begin(uint8_t channel, const uint8_t peerMac[6]);
+
+    bool sendTelemetry(TelemetryPacket& pkt);   // stamps sequence_number
+    bool sendAck(const WaypointACKPacket& pkt);
+    bool sendBatteryReport(const BatteryReportPacket& pkt);
+
+    // Inbound queues (created in begin), drained by the IO task.
+    static QueueHandle_t commandQueue;    // holds CommandPacket
+    static QueueHandle_t waypointQueue;   // holds WaypointArrayPacket
+
+    static uint32_t droppedPackets;       // malformed / unknown length
+
+private:
+    static uint8_t  _peerMac[6];
+    static uint32_t _txSequence;
+
+    static void onDataRecv(const uint8_t* mac_addr,
+                           const uint8_t* data, int len);
+};
+
+#endif // USV_ESPNOW_LINK_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\control\EllipseTracker.h =====
+#ifndef USV_ELLIPSE_TRACKER_H
+#define USV_ELLIPSE_TRACKER_H
+
+// Cross-track controller for an elliptical reference path. Computes the
+// normalized ellipse error E = (x/a)^2 + (y/b)^2 - 1 and steers to drive
+// |E| -> 0. Position is relative to the ellipse center (meters).
+class EllipseTracker {
+public:
+    EllipseTracker(float gain = 120.0f) : _gain(gain) {}
+
+    // x,y: boat position relative to ellipse center.
+    // a,b: semi-axes. basePwm: forward cruise PWM.
+    void calculateEllipticalThrust(float x, float y, float a, float b,
+                                   int basePwm, int& leftPwm, int& rightPwm);
+
+    // Signed cross-track error metric.
+    static float crossTrackError(float x, float y, float a, float b);
+
+private:
+    float _gain;
+};
+
+#endif // USV_ELLIPSE_TRACKER_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\control\HeadingController.h =====
+#ifndef USV_HEADING_CONTROLLER_H
+#define USV_HEADING_CONTROLLER_H
+
+#include "PidController.h"
+
+// Turns a desired bearing + current heading into differential thruster PWM.
+// Uses shortest-turn error and a PID correction around a base cruise speed.
+class HeadingController {
+public:
+    HeadingController(float kp, float ki, float kd);
+
+    // Shortest signed turn (-180..180) from current to target heading.
+    static float computeHeadingError(float targetDeg, float currentDeg);
+
+    // Fills left/right PWM: left = base + corr, right = base - corr.
+    void calculateThrusterOutputs(float targetBearing, float currentHeading,
+                                  int basePwm, float dt,
+                                  int& leftPwm, int& rightPwm);
+
+    void reset() { _pid.reset(); }
+
+private:
+    PidController _pid;
+};
+
+#endif // USV_HEADING_CONTROLLER_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\control\PidController.h =====
+#ifndef USV_PID_CONTROLLER_H
+#define USV_PID_CONTROLLER_H
+
+// Generic PID with low-pass filtered derivative and clamping anti-windup.
+// See PID_Control_Guide.md and codebase_mathematical_models.md.
+class PidController {
+public:
+    PidController(float kp, float ki, float kd,
+                  float outMin, float outMax,
+                  float derivAlpha = 0.30f);
+
+    float update(float error, float dt);
+    void  reset();
+
+    void  setTunings(float kp, float ki, float kd);
+
+private:
+    float _kp, _ki, _kd;
+    float _outMin, _outMax;
+    float _alpha;          // derivative low-pass factor
+    float _integral;
+    float _prevError;
+    float _prevDeriv;
+    bool  _hasPrev;
+};
+
+#endif // USV_PID_CONTROLLER_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\control\SpiralController.h =====
+#ifndef USV_SPIRAL_CONTROLLER_H
+#define USV_SPIRAL_CONTROLLER_H
+
+// Super-Twisting Sliding Mode Control (STSMC) for a twin-motor USV tracking a
+// spiral path. Port of TwinMotorUSVController (USV_Spiral_Tracking_Summary.md).
+
+// Vehicle state in the local ENU frame.
+struct UsvState {
+    double x, y;     // position (m)
+    double psi;      // heading (rad)
+    double u, v;     // surge, sway velocity (m/s)
+    double r;        // yaw rate (rad/s)
+};
+
+// Guidance target (from LOS over the spiral reference).
+struct UsvTarget {
+    double x_ref, y_ref;   // reference point on the spiral
+    double u_d;            // desired surge speed (m/s)
+};
+
+struct ControlOutput {
+    double tau_u;     // surge force command (N)
+    double tau_r;     // yaw moment command (N*m)
+    double T_port;    // port thruster force (N)
+    double T_stbd;    // starboard thruster force (N)
+    int    pwm_port;  // -255..255
+    int    pwm_stbd;  // -255..255
+};
+
+class SpiralController {
+public:
+    SpiralController(double halfBeam = 0.375,   // B/2, thruster moment arm (m)
+                     double maxThrust = 30.0,   // per-thruster saturation (N)
+                     double losLookahead = 3.0);// LOS lookahead distance (m)
+
+    ControlOutput computeControlInputs(const UsvState& s, const UsvTarget& t, double dt);
+    void reset();
+
+private:
+    // Rigid-body + added-mass + drag model parameters.
+    double _m_u, _m_r;      // effective surge/yaw inertia
+    double _d_u, _d_r;      // linear drag surge/yaw
+    double _B_half;         // moment arm
+    double _Tmax;
+    double _losLookahead;
+
+    // STSMC gains (surge and yaw channels).
+    double _k1_u, _k2_u;
+    double _k1_r, _k2_r;
+
+    // Super-twisting integral states.
+    double _sigma_u_int;
+    double _sigma_r_int;
+
+    int forceToPwm(double force) const;
+};
+
+#endif // USV_SPIRAL_CONTROLLER_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\core\MissionFsm.h =====
+#ifndef USV_MISSION_FSM_H
+#define USV_MISSION_FSM_H
+
+#include <stdint.h>
+#include "../safety/SafetyManager.h"
+
+// Mission states (value doubles as TelemetryPacket.current_mode).
+enum BoatState : uint8_t {
+    STATE_STANDBY        = 0,
+    STATE_GRID_PATROL    = 1,
+    STATE_SPIRAL_MAPPING = 2,
+    STATE_RTH            = 3,
+    STATE_EMERGENCY_STOP = 4
+};
+
+// Decoupled inputs so the FSM has no hardware dependencies (unit-testable).
+struct FsmInputs {
+    bool        startCommand;    // operator START
+    bool        emergencyCommand;// operator Emergency Stop
+    bool        forceRthCommand; // operator Force RTH
+    bool        anomalyDetected; // WaterAnomalyMonitor::shouldTriggerSpiral
+    bool        spiralComplete;  // SpiralPlanner finished all turns
+    bool        gridComplete;    // Navigator ran out of patrol waypoints
+    bool        arrivedHome;     // reached the home waypoint during RTH
+    SafetyState safety;          // aggregated safety verdict
+};
+
+// 5-state mission finite state machine (codebase_mathematical_models.md).
+class MissionFsm {
+public:
+    MissionFsm();
+
+    void      begin();
+    BoatState tick(const FsmInputs& in);
+    BoatState state() const { return _state; }
+
+private:
+    BoatState _state;
+};
+
+#endif // USV_MISSION_FSM_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\core\Tasks.h =====
+#ifndef USV_TASKS_H
+#define USV_TASKS_H
+
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+
+#include "Packets.h"
+#include "sensors/WaterSensors.h"
+#include "sensors/BatteryMonitor.h"
+#include "sensors/Compass.h"
+#include "sensors/GpsModule.h"
+#include "actuators/MotorDriver.h"
+#include "control/HeadingController.h"
+#include "control/SpiralController.h"
+#include "control/EllipseTracker.h"
+#include "navigation/Navigator.h"
+#include "navigation/SpiralPlanner.h"
+#include "detection/WaterAnomalyMonitor.h"
+#include "comms/EspNowLink.h"
+#include "storage/DataLogger.h"
+#include "safety/Watchdog.h"
+#include "safety/SafetyManager.h"
+#include "core/MissionFsm.h"
+
+// Command flags produced by the IO task (from inbound ESP-NOW) and consumed by
+// the navigation task. Protected by SystemContext::stateMutex.
+struct CommandState {
+    bool  start;
+    bool  emergency;
+    bool  forceRth;
+    bool  manualMode;
+    int   manualSteer;
+    int   manualSpeed;
+};
+
+// Everything the tasks need, allocated once in main and passed by pointer.
+struct SystemContext {
+    WaterSensors*        water;
+    BatteryMonitor*      battery;
+    Compass*             compass;
+    GpsModule*           gps;
+    MotorDriver*         motor;
+    HeadingController*   heading;
+    SpiralController*    spiral;
+    EllipseTracker*      ellipse;
+    Navigator*           nav;
+    SpiralPlanner*       spiralPlanner;
+    WaterAnomalyMonitor* anomaly;
+    EspNowLink*          link;
+    DataLogger*          logger;
+    Watchdog*            wdt;
+    SafetyManager*       safety;
+    MissionFsm*          fsm;
+
+    QueueHandle_t     logQueue;      // TelemetryPacket -> SD writer
+    SemaphoreHandle_t stateMutex;    // guards snapshot + command
+
+    TelemetryPacket   snapshot;      // latest telemetry (nav writes, io reads)
+    CommandState      command;       // latest operator command (io writes)
+};
+
+// Core 1: navigation + control @ 20 Hz. pv = SystemContext*.
+void navigationTask(void* pv);
+
+// Core 0: ESP-NOW drain, telemetry TX, SD logging. pv = SystemContext*.
+void ioTask(void* pv);
+
+#endif // USV_TASKS_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\detection\WaterAnomalyMonitor.h =====
+#ifndef USV_WATER_ANOMALY_MONITOR_H
+#define USV_WATER_ANOMALY_MONITOR_H
+
+#include <Arduino.h>
+
+// Detects wastewater/pollution anomalies from pH, turbidity and temperature.
+// Techniques: simple moving average (SMA) smoothing, turbidity rate-of-change
+// (ROC), EMA baseline deviation, un-ionized ammonia toxicity, and a
+// time-of-day pH envelope. See outdoor_pond_wastewater_insights.md.
+//
+// Decision #5: spiral is triggered by a single OR rule (see shouldTriggerSpiral).
+class WaterAnomalyMonitor {
+public:
+    WaterAnomalyMonitor();
+
+    // Feed the newest sample. hour = local hour 0-23 (for pH envelope).
+    // Returns true if an anomaly is currently flagged.
+    bool  updateReadings(float ph, float turbidity, float temp, int hour = 12);
+
+    // Fraction of toxic un-ionized ammonia (NH3) given pH & temperature.
+    float calculateAmmoniaToxicity(float ph, float temp);
+
+    bool  shouldTriggerSpiral() const { return _triggerSpiral; }
+    float lastAnomalyScore()    const { return _anomalyScore; }
+    float turbidityRoc()        const { return _turbRoc; }
+
+private:
+    static const int SMA_WINDOW = 8;
+
+    float _phBuf[SMA_WINDOW];
+    float _turbBuf[SMA_WINDOW];
+    int   _bufIdx;
+    int   _bufCount;
+
+    float _turbBaselineEma;   // slow EMA baseline
+    float _lastTurb;
+    unsigned long _lastSampleTime;
+
+    bool  _triggerSpiral;
+    float _anomalyScore;
+    float _turbRoc;
+
+    float sma(const float* buf) const;
+    float phHighLimitForHour(int hour) const;
+};
+
+#endif // USV_WATER_ANOMALY_MONITOR_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\navigation\Navigator.h =====
+#ifndef USV_NAVIGATOR_H
+#define USV_NAVIGATOR_H
+
+#include <stdint.h>
+#include "Packets.h"
+
+// Waypoint management + geodesic helpers (Haversine distance / great-circle
+// bearing). Pure math (no Arduino deps) so it is unit-testable on native.
+// See codebase_mathematical_models.md.
+class Navigator {
+public:
+    static const int MAX_WAYPOINTS = 64;
+
+    Navigator();
+
+    // --- Static geodesy helpers (degrees in, meters / degrees out) ---
+    static double calculateDistance(double lat1, double lon1,
+                                    double lat2, double lon2);      // meters
+    static double calculateBearing(double lat1, double lon1,
+                                   double lat2, double lon2);       // 0-360 deg
+
+    // --- Waypoint list management ---
+    void     loadWaypoints(const WaypointArrayPacket& pkt);         // replace list
+    bool     appendBatch(const WaypointArrayPacket& pkt);           // multi-batch
+    void     clear();
+    bool     hasWaypoints() const { return _count > 0; }
+    int      count() const { return _count; }
+
+    Waypoint currentTarget() const;
+    bool     isWaypointReached(double lat, double lon,
+                               double radiusM) const;
+    void     advanceWaypoint();
+    bool     missionComplete() const { return _index >= _count; }
+
+private:
+    Waypoint _wps[MAX_WAYPOINTS];
+    int      _count;
+    int      _index;
+};
+
+#endif // USV_NAVIGATOR_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\navigation\SpiralPlanner.h =====
+#ifndef USV_SPIRAL_PLANNER_H
+#define USV_SPIRAL_PLANNER_H
+
+#include "Packets.h"
+
+// Generates Archimedean spiral waypoints (r = a + b*theta) around a center
+// GPS coordinate, converting local polar offsets to lat/lon. Pure math.
+// Bounded by SPIRAL_MAX_RADIUS_M / SPIRAL_MAX_THETA (config.h).
+class SpiralPlanner {
+public:
+    SpiralPlanner();
+
+    void begin(double centerLat, double centerLon);
+    void reset();
+
+    // Fetch the next spiral waypoint; returns false when spiral is complete.
+    bool nextSpiralPoint(Waypoint& out);
+
+    // Convert a local (radius, theta) polar offset to an absolute waypoint.
+    static Waypoint calculateSpiralOffset(double centerLat, double centerLon,
+                                          double radiusM, double thetaRad);
+
+    bool complete() const { return _complete; }
+
+private:
+    double _centerLat, _centerLon;
+    double _theta;
+    bool   _complete;
+};
+
+#endif // USV_SPIRAL_PLANNER_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\safety\SafetyManager.h =====
+#ifndef USV_SAFETY_MANAGER_H
+#define USV_SAFETY_MANAGER_H
+
+#include <Arduino.h>
+
+// Priority-ordered safety states. Higher value = more severe.
+enum class SafetyState {
+    NORMAL           = 0,
+    LOW_BATTERY_RTH  = 1,   // battery <= VOLTAGE_RTH -> return home
+    OVERCURRENT_STOP = 2,   // motor stall / short -> cut thrust
+    LEAK_STOP        = 3,   // hull water ingress detected
+    CRITICAL_STOP    = 4    // battery <= VOLTAGE_CRITICAL -> hard stop
+};
+
+// Aggregates hardware guards (battery voltage, ACS712 current, leak sensor)
+// into a single actionable state with hysteresis on the battery threshold.
+class SafetyManager {
+public:
+    SafetyManager();
+
+    // currentA: measured motor current (A). leak: true if water detected.
+    SafetyState evaluate(float batteryV, float currentA, bool leak);
+
+    SafetyState state() const { return _state; }
+    bool isEmergency() const {
+        return _state == SafetyState::OVERCURRENT_STOP ||
+               _state == SafetyState::LEAK_STOP ||
+               _state == SafetyState::CRITICAL_STOP;
+    }
+    bool needsReturnHome() const { return _state == SafetyState::LOW_BATTERY_RTH; }
+
+private:
+    SafetyState   _state;
+    unsigned long _overcurrentSince;   // debounce transient current spikes
+};
+
+#endif // USV_SAFETY_MANAGER_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\safety\Watchdog.h =====
+#ifndef USV_WATCHDOG_H
+#define USV_WATCHDOG_H
+
+#include <Arduino.h>
+
+// Thin wrapper over the ESP-IDF task watchdog (esp_task_wdt). Each RTOS task
+// that could hang subscribes itself and must feed() within the timeout, or the
+// chip resets. See project_prerequisites.md 6.1.
+class Watchdog {
+public:
+    // Initialise the TWDT once (panic reset on timeout).
+    void begin(uint32_t timeoutSec = 3);
+
+    // Register the CALLING task with the watchdog.
+    void subscribeCurrentTask();
+
+    // Kick the watchdog for the calling task (call each loop iteration).
+    void feed();
+
+private:
+    bool _initialised = false;
+};
+
+#endif // USV_WATCHDOG_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\sensors\BatteryMonitor.h =====
+#ifndef USV_BATTERY_MONITOR_H
+#define USV_BATTERY_MONITOR_H
+
+#include <Arduino.h>
+
+// Propulsion LiPo 3S monitoring: voltage divider read + Coulomb counting + SoC.
+// See battery_management_prediction.md.
+class BatteryMonitor {
+public:
+    BatteryMonitor();
+
+    void  begin();
+
+    // Instantaneous propulsion-pack voltage (via divider on BATTERY_ADC_PIN).
+    float readVoltage();
+
+    // Accumulate consumed charge; call regularly with measured current (mA).
+    void  updateCoulombCounter(float current_mA);
+
+    // Estimated minutes remaining (Coulomb method).
+    float getRemainingMinutes();
+
+    // Voltage -> State of Charge (%) via LiPo 3S lookup + interpolation.
+    float getSoCPercent(float voltage);
+
+    // Convenience: SoC of the last measured voltage, clamped 0-100.
+    uint8_t getBatteryPercent();
+
+private:
+    float         _totalCapacity_mAh;
+    float         _consumed_mAh;
+    unsigned long _lastSampleTime;
+    float         _currentAvg_mA;
+    float         _lastVoltage;
+};
+
+#endif // USV_BATTERY_MONITOR_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\sensors\Compass.h =====
+#ifndef USV_COMPASS_H
+#define USV_COMPASS_H
+
+#include <Arduino.h>
+
+// QMC5883L 3-axis magnetometer (raw I2C register access at 0x0D) with
+// hard-iron offset, soft-iron scale, and magnetic declination correction.
+// See project_prerequisites.md 6.2.
+class Compass {
+public:
+    Compass();
+
+    bool  begin();
+    void  update();               // read raw XYZ from the sensor
+    float getHeadingDeg();        // 0-360, north-referenced + declination
+
+    void  setHardIron(float x, float y, float z);
+    void  setSoftIron(float sx, float sy, float sz);
+    void  setDeclination(float degrees);
+    float applyDeclination(float headingDeg);
+
+    // Blocking figure-8 calibration helper (call from bench routine).
+    void  runCalibration(unsigned long durationMs);
+
+private:
+    int16_t _rawX, _rawY, _rawZ;
+    float   _offX, _offY, _offZ;
+    float   _scaleX, _scaleY, _scaleZ;
+    float   _declination;
+
+    bool    writeRegister(uint8_t reg, uint8_t value);
+};
+
+#endif // USV_COMPASS_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\sensors\GpsModule.h =====
+#ifndef USV_GPS_MODULE_H
+#define USV_GPS_MODULE_H
+
+#include <Arduino.h>
+#include <TinyGPSPlus.h>
+
+struct GpsFix {
+    double  lat;
+    double  lon;
+    float   hdop;
+    uint8_t sats;
+    bool    valid;
+};
+
+// Tiered response to GPS degradation (gps_drift_solutions.md).
+enum class GpsLossTier {
+    NONE,            // fresh valid fix
+    DEAD_RECKONING,  // < 10s: coast on last heading/speed
+    SAFE_FLOAT,      // 10-60s: stop motors, hold position
+    EMERGENCY_RTH    // > 60s: escalate to safety layer
+};
+
+// NEO-8M over UART2 with fix-quality gate, low-pass position filter and
+// "sea mode" dynamic model configuration (UBX-CFG-NAV5).
+class GpsModule {
+public:
+    GpsModule();
+
+    void        begin();
+    void        configureSeaMode();   // UBX dynamic model = Sea (5)
+    bool        update();             // pump serial bytes into parser
+    bool        isFixValid();         // sats>=6 && hdop<2.0
+    GpsFix      getFilteredFix();
+    GpsLossTier getLossTier();
+    unsigned long timeSinceFix() const;
+
+private:
+    TinyGPSPlus   _gps;
+    double        _filtLat, _filtLon;
+    bool          _filterInit;
+    unsigned long _lastValidFixMs;
+
+    void applyLowPassFilter(double lat, double lon);
+    void sendUbx(const uint8_t* msg, size_t len);
+};
+
+#endif // USV_GPS_MODULE_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\sensors\WaterSensors.h =====
+#ifndef USV_WATER_SENSORS_H
+#define USV_WATER_SENSORS_H
+
+#include <Arduino.h>
+#include <Adafruit_ADS1X15.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// Reads pH + turbidity via external ADS1115 (5V range) and water temperature
+// via DS18B20 (non-blocking). See codebase_mathematical_models.md.
+class WaterSensors {
+public:
+    WaterSensors();
+
+    bool begin();
+
+    // Non-blocking temperature: call every loop; refreshes at DS18B20 conversion rate.
+    void  updateTemperatureNonBlocking();
+    float getWaterTemp() const { return _waterTemp; }
+
+    // pH with Nernst temperature compensation (tempC from getWaterTemp()).
+    float readPh(float tempC);
+
+    // Turbidity in NTU via quadratic regression with voltage clamps.
+    float readTurbidityNtu();
+
+private:
+    Adafruit_ADS1115  _ads;
+    OneWire           _oneWire;
+    DallasTemperature _temp;
+    unsigned long     _lastTempRequest;
+    float             _waterTemp;
+    bool              _adsReady;
+
+    float readChannelVoltage(uint8_t channel);
+};
+
+#endif // USV_WATER_SENSORS_H
+===== C:\Users\Icezy\OneDrive\Desktop\source\1_Firmware\src\storage\DataLogger.h =====
+#ifndef USV_DATA_LOGGER_H
+#define USV_DATA_LOGGER_H
+
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include "Packets.h"
+
+// Appends telemetry rows to a CSV on the SD card. Guards the shared SPI bus
+// with a mutex and flushes at most once per second to bound data loss on power
+// cut. See project_vulnerabilities.md section 6.
+class DataLogger {
+public:
+    DataLogger();
+
+    bool begin();                       // mounts SD, writes CSV header if new
+    void logRecord(const TelemetryPacket& pkt);
+    bool checkIntegrity();              // verify card still responds
+    bool isReady() const { return _ready; }
+
+private:
+    SemaphoreHandle_t _spiMutex;
+    bool              _ready;
+    unsigned long     _lastFlush;
+    char              _filename[24];
+
+    void openAndWriteHeader();
+};
+
+#endif // USV_DATA_LOGGER_H
