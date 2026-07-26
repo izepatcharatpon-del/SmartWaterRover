@@ -13,16 +13,18 @@ class DataLogger {
 public:
     DataLogger();
 
-    bool begin();                       // mounts SD, writes CSV header if new
-    void logRecord(const TelemetryPacket& pkt);
+    bool begin();                       // mounts SD, opens a per-boot CSV
+    bool logRecord(const TelemetryPacket& pkt);  // false on write/SD failure
     bool checkIntegrity();              // verify card still responds
     bool isReady() const { return _ready; }
+    uint32_t writeFailCount() const { return _writeFailCount; }
 
 private:
     SemaphoreHandle_t _spiMutex;
     bool              _ready;
     unsigned long     _lastFlush;
-    char              _filename[24];
+    uint32_t          _writeFailCount;
+    char              _filename[32];
 
     void openAndWriteHeader();
 };

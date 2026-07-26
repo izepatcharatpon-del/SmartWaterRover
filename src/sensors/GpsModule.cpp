@@ -4,11 +4,17 @@
 GpsModule::GpsModule()
     : _filtLat(0.0), _filtLon(0.0),
       _filterInit(false),
-      _lastValidFixMs(0) {}
+      _lastValidFixMs(0),
+      _everHadFix(false),
+      _faultLatched(false) {}
 
 void GpsModule::begin() {
     Serial2.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    _lastValidFixMs = millis();
+    // Do not stamp a fake "last fix" at boot — that made getLossTier() report OK
+    // for ~GPS_LOSS_HOLD_MS with no satellites.
+    _lastValidFixMs = 0;
+    _everHadFix = false;
+    _faultLatched = false;
 }
 
 void GpsModule::sendUbx(const uint8_t* msg, size_t len) {
@@ -17,28 +23,26 @@ void GpsModule::sendUbx(const uint8_t* msg, size_t len) {
 }
 
 void GpsModule::configureSeaMode() {
-    // UBX-CFG-NAV5: set dynamic platform model = 5 (Sea). Only dynModel masked.
     uint8_t cfg[] = {
         0xB5, 0x62, 0x06, 0x24, 0x24, 0x00,
-        0x01, 0x00,             // mask: apply dynModel only
-        0x05,                   // dynModel = Sea
-        0x03,                   // fixMode = auto 2D/3D
-        0x00, 0x00, 0x00, 0x00, // fixedAlt
-        0x10, 0x27, 0x00, 0x00, // fixedAltVar
-        0x05,                   // minElev
-        0x00,                   // drLimit
-        0xFA, 0x00,             // pDop
-        0xFA, 0x00,             // tDop
-        0x64, 0x00,             // pAcc
-        0x2C, 0x01,             // tAcc
-        0x00,                   // staticHoldThresh
-        0x00,                   // dgnssTimeout
+        0x01, 0x00,
+        0x05,
+        0x03,
+        0x00, 0x00, 0x00, 0x00,
+        0x10, 0x27, 0x00, 0x00,
+        0x05,
+        0x00,
+        0xFA, 0x00,
+        0xFA, 0x00,
+        0x64, 0x00,
+        0x2C, 0x01,
+        0x00,
+        0x00,
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00,
-        0x00, 0x00              // checksum placeholder (computed below)
+        0x00, 0x00
     };
-    // Compute Fletcher checksum over class..payload (bytes 2..end-2).
     uint8_t ckA = 0, ckB = 0;
     for (size_t i = 2; i < sizeof(cfg) - 2; i++) {
         ckA += cfg[i];
@@ -51,21 +55,36 @@ void GpsModule::configureSeaMode() {
 
 bool GpsModule::update() {
     bool gotSentence = false;
-    while (Serial2.available() > 0) {
+    int bytes = 0;
+    while (Serial2.available() > 0 && bytes < GPS_MAX_BYTES_PER_UPDATE) {
         if (_gps.encode(Serial2.read())) gotSentence = true;
+        bytes++;
     }
     if (gotSentence && isFixValid()) {
         applyLowPassFilter(_gps.location.lat(), _gps.location.lng());
         _lastValidFixMs = millis();
+        _everHadFix = true;
     }
     return gotSentence;
 }
 
 bool GpsModule::isFixValid() {
     if (!_gps.location.isValid()) return false;
+    // Prefer age-aware checks when TinyGPSPlus provides them.
+    if (_gps.location.age() > GPS_FRESH_FIX_MS) return false;
     uint8_t sats = _gps.satellites.isValid() ? _gps.satellites.value() : 0;
     float   hdop = _gps.hdop.isValid() ? _gps.hdop.hdop() : 99.0f;
     return (sats >= GPS_MIN_SATS) && (hdop < GPS_MAX_HDOP);
+}
+
+bool GpsModule::hasFreshFix() {
+    return isFixValid() && timeSinceFix() <= GPS_FRESH_FIX_MS;
+}
+
+bool GpsModule::clearFaultIfFresh() {
+    if (!hasFreshFix()) return false;
+    _faultLatched = false;
+    return true;
 }
 
 void GpsModule::applyLowPassFilter(double lat, double lon) {
@@ -75,8 +94,15 @@ void GpsModule::applyLowPassFilter(double lat, double lon) {
         _filterInit = true;
         return;
     }
-    _filtLat = GPS_FILTER_ALPHA * lat + (1.0f - GPS_FILTER_ALPHA) * _filtLat;
-    _filtLon = GPS_FILTER_ALPHA * lon + (1.0f - GPS_FILTER_ALPHA) * _filtLon;
+    _filtLat = GPS_FILTER_ALPHA * lat + (1.0 - GPS_FILTER_ALPHA) * _filtLat;
+
+    // Wrap longitude error across ±180° before blending.
+    double dLon = lon - _filtLon;
+    while (dLon > 180.0)  dLon -= 360.0;
+    while (dLon < -180.0) dLon += 360.0;
+    _filtLon = _filtLon + GPS_FILTER_ALPHA * dLon;
+    while (_filtLon > 180.0)  _filtLon -= 360.0;
+    while (_filtLon < -180.0) _filtLon += 360.0;
 }
 
 GpsFix GpsModule::getFilteredFix() {
@@ -85,18 +111,41 @@ GpsFix GpsModule::getFilteredFix() {
     fix.lon   = _filtLon;
     fix.hdop  = _gps.hdop.isValid() ? _gps.hdop.hdop() : 99.0f;
     fix.sats  = _gps.satellites.isValid() ? _gps.satellites.value() : 0;
-    fix.valid = _filterInit && (getLossTier() == GpsLossTier::NONE);
+    // Never navigate or declare arrival from held/stale coordinates.
+    fix.valid = _filterInit && !_faultLatched && hasFreshFix();
     return fix;
 }
 
 unsigned long GpsModule::timeSinceFix() const {
+    if (!_everHadFix || _lastValidFixMs == 0) return 0;
     return millis() - _lastValidFixMs;
 }
 
 GpsLossTier GpsModule::getLossTier() {
+    if (_faultLatched) return GpsLossTier::GPS_FAULT;
+
+    // No quality fix since boot: not OK, but do not latch FAULT until we have
+    // acquired then lost a fix for GPS_LOSS_FAULT_MS.
+    if (!_everHadFix) return GpsLossTier::SAFE_STOP;
+
     unsigned long elapsed = timeSinceFix();
-    if (elapsed < GPS_LOSS_T1_MS) return GpsLossTier::NONE;
-    if (elapsed < GPS_LOSS_T2_MS) return GpsLossTier::DEAD_RECKONING;
-    if (elapsed < 2 * GPS_LOSS_T2_MS) return GpsLossTier::SAFE_FLOAT;
-    return GpsLossTier::EMERGENCY_RTH;
+    if (elapsed < GPS_LOSS_HOLD_MS) return GpsLossTier::OK;
+    if (elapsed < GPS_LOSS_SAFE_STOP_MS) return GpsLossTier::SAFE_STOP;
+    if (elapsed < GPS_LOSS_FAULT_MS) return GpsLossTier::SAFE_STOP;
+
+    _faultLatched = true;
+    return GpsLossTier::GPS_FAULT;
+}
+
+bool GpsModule::hasTime() const {
+    return _gps.time.isValid() && const_cast<TinyGPSTime&>(_gps.time).age() < 5000;
+}
+
+int GpsModule::localHour() const {
+    if (!hasTime()) return -1;
+    // TinyGPSPlus hour() is non-const; cast is safe (read-only use).
+    int hour = (int)const_cast<TinyGPSTime&>(_gps.time).hour();
+    hour = (hour + GPS_TIMEZONE_OFFSET_H) % 24;
+    if (hour < 0) hour += 24;
+    return hour;
 }

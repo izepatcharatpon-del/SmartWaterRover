@@ -15,17 +15,23 @@ enum BoatState : uint8_t {
 
 // Decoupled inputs so the FSM has no hardware dependencies (unit-testable).
 struct FsmInputs {
-    bool        startCommand;    // operator START
-    bool        emergencyCommand;// operator Emergency Stop
-    bool        forceRthCommand; // operator Force RTH
-    bool        anomalyDetected; // WaterAnomalyMonitor::shouldTriggerSpiral
-    bool        spiralComplete;  // SpiralPlanner finished all turns
-    bool        gridComplete;    // Navigator ran out of patrol waypoints
-    bool        arrivedHome;     // reached the home waypoint during RTH
-    SafetyState safety;          // aggregated safety verdict
+    bool        startCommand;     // CMD_START_ARM
+    bool        clearEstop;       // CMD_CLEAR_ESTOP
+    bool        emergencyCommand; // CMD_EMERGENCY_STOP
+    bool        forceRthCommand;  // CMD_FORCE_RTH
+    bool        anomalyDetected;  // WaterAnomalyMonitor (after hysteresis)
+    bool        spiralComplete;   // SpiralPlanner finished all turns
+    bool        gridComplete;     // Navigator ran out of patrol waypoints
+    bool        arrivedHome;      // reached home during RTH
+    bool        gpsOk;            // GPS usable for navigation
+    bool        gpsFault;         // prolonged, latched GPS loss
+    bool        homeSet;          // home waypoint captured this mission
+    bool        compassOk;        // heading usable
+    bool        hasWaypoints;     // Navigator mission ready (upload sealed)
+    SafetyState safety;           // aggregated safety verdict
 };
 
-// 5-state mission finite state machine (codebase_mathematical_models.md).
+// 5-state mission finite state machine.
 class MissionFsm {
 public:
     MissionFsm();

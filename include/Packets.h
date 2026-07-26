@@ -14,7 +14,7 @@
 
 // General command / emergency button (5 bytes)
 typedef struct __attribute__((packed)) {
-    uint8_t sys_command;    // 0=Normal, 1=Emergency Stop, 2=Force RTH
+    uint8_t sys_command;    // see CommandCode
     int16_t manual_steer;   // -255..255
     int16_t manual_speed;   // -255..255
 } CommandPacket;
@@ -62,10 +62,16 @@ typedef struct __attribute__((packed)) {
 } BatteryReportPacket;
 
 // ---------- Command codes -----------------------------------------------------
+// Wire size of CommandPacket stays 5 bytes; only the meaning of sys_command grows.
 enum CommandCode {
-    CMD_NORMAL          = 0,
-    CMD_EMERGENCY_STOP  = 1,
-    CMD_FORCE_RTH       = 2
+    CMD_NORMAL              = 0,  // idle / clear force-RTH latch (does NOT clear E-Stop)
+    CMD_EMERGENCY_STOP      = 1,  // latch E-Stop immediately
+    CMD_FORCE_RTH           = 2,  // force return-to-home
+    CMD_START_ARM           = 3,  // arm mission start (requires waypoints + GPS)
+    CMD_CLEAR_ESTOP         = 4,  // explicit clear of latched E-Stop -> STANDBY
+    // Seal multi-batch waypoint upload when the last batch is full (count==12).
+    // Batches with waypoint_count < 12 auto-seal. Wire size unchanged.
+    CMD_MISSION_UPLOAD_DONE = 5
 };
 
 enum AckStatus {

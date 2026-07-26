@@ -8,8 +8,8 @@
 // chip resets. See project_prerequisites.md 6.1.
 class Watchdog {
 public:
-    // Initialise the TWDT once (panic reset on timeout).
-    void begin(uint32_t timeoutSec = 3);
+    // Initialise the TWDT once (panic reset on timeout). Returns false on hard fail.
+    bool begin(uint32_t timeoutSec = 3);
 
     // Register the CALLING task with the watchdog.
     void subscribeCurrentTask();

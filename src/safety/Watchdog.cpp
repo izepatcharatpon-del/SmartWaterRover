@@ -1,10 +1,15 @@
 #include "Watchdog.h"
 #include <esp_task_wdt.h>
 
-void Watchdog::begin(uint32_t timeoutSec) {
-    // Arduino-ESP32 core 2.x uses esp_task_wdt_init directly.
-    esp_task_wdt_init(timeoutSec, true);
+bool Watchdog::begin(uint32_t timeoutSec) {
+    // Arduino-ESP32 may already have initialised TWDT — treat that as OK.
+    esp_err_t err = esp_task_wdt_init(timeoutSec, true);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        _initialised = false;
+        return false;
+    }
     _initialised = true;
+    return true;
 }
 
 void Watchdog::subscribeCurrentTask() {
@@ -13,5 +18,6 @@ void Watchdog::subscribeCurrentTask() {
 }
 
 void Watchdog::feed() {
+    if (!_initialised) return;
     esp_task_wdt_reset();
 }

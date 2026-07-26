@@ -3,19 +3,11 @@
 
 #include <Arduino.h>
 
-// Dual BTS7960 H-bridges driving two thrusters. Uses ESP32 LEDC at 20 kHz,
-// 8-bit resolution. Signed PWM: positive = forward, negative = reverse.
-// See USV_Power_Management_Guide.md and USV_Hardware_GPIO_Mapping.md.
+// Dual BTS7960 H-bridges. Signed PWM: positive = forward, negative = reverse.
 class MotorDriver {
 public:
     void begin();
-
-    // leftPwm / rightPwm in [-255, 255]; internally capped to MOTOR_PWM_LIMIT.
-    void writeThrust(int leftPwm, int rightPwm);
-
-    // Map a commanded thrust force (N) to an 8-bit PWM magnitude.
-    int  forceToPwm(float forceN, float maxThrustN);
-
+    void writeThrust(int leftPwm, int rightPwm);  // [-MOTOR_PWM_LIMIT, +…]
     void stop();
 
 private:

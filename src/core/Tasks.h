@@ -13,8 +13,6 @@
 #include "sensors/GpsModule.h"
 #include "actuators/MotorDriver.h"
 #include "control/HeadingController.h"
-#include "control/SpiralController.h"
-#include "control/EllipseTracker.h"
 #include "navigation/Navigator.h"
 #include "navigation/SpiralPlanner.h"
 #include "detection/WaterAnomalyMonitor.h"
@@ -24,18 +22,20 @@
 #include "safety/SafetyManager.h"
 #include "core/MissionFsm.h"
 
-// Command flags produced by the IO task (from inbound ESP-NOW) and consumed by
-// the navigation task. Protected by SystemContext::stateMutex.
+// Command flags produced by the IO task and consumed by the navigation task.
+// Protected by SystemContext::stateMutex.
 struct CommandState {
-    bool  start;
-    bool  emergency;
-    bool  forceRth;
-    bool  manualMode;
-    int   manualSteer;
-    int   manualSpeed;
+    bool     start;
+    bool     clearEstop;
+    bool     emergency;
+    bool     forceRth;
+    bool     sealMissionUpload;
+    bool     manualMode;
+    int      manualSteer;
+    int      manualSpeed;
+    uint32_t lastManualMs;
 };
 
-// Everything the tasks need, allocated once in main and passed by pointer.
 struct SystemContext {
     WaterSensors*        water;
     BatteryMonitor*      battery;
@@ -43,8 +43,6 @@ struct SystemContext {
     GpsModule*           gps;
     MotorDriver*         motor;
     HeadingController*   heading;
-    SpiralController*    spiral;
-    EllipseTracker*      ellipse;
     Navigator*           nav;
     SpiralPlanner*       spiralPlanner;
     WaterAnomalyMonitor* anomaly;
@@ -54,17 +52,17 @@ struct SystemContext {
     SafetyManager*       safety;
     MissionFsm*          fsm;
 
-    QueueHandle_t     logQueue;      // TelemetryPacket -> SD writer
-    SemaphoreHandle_t stateMutex;    // guards snapshot + command
+    QueueHandle_t     logQueue;
+    SemaphoreHandle_t stateMutex;
 
-    TelemetryPacket   snapshot;      // latest telemetry (nav writes, io reads)
-    CommandState      command;       // latest operator command (io writes)
+    TelemetryPacket   snapshot;
+    CommandState      command;
+    float             batteryVoltage;
+    uint32_t          logDropCount;
+    uint32_t          ackDropCount;
 };
 
-// Core 1: navigation + control @ 20 Hz. pv = SystemContext*.
 void navigationTask(void* pv);
-
-// Core 0: ESP-NOW drain, telemetry TX, SD logging. pv = SystemContext*.
 void ioTask(void* pv);
 
 #endif // USV_TASKS_H

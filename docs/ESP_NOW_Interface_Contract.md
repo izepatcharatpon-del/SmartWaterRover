@@ -49,6 +49,9 @@
 | `WaypointACKPacket` | 2 B | ต่อ 1 batch ที่รับ |
 | `BatteryReportPacket` | 20 B | ~ทุก 5 นาที (optional) |
 
+> บิลด์ AA118-only ไม่มีเซนเซอร์กระแส: `current_draw_ma=0` และ
+> `estimated_tte_min=NaN`; ใช้ `battery_voltage/state_of_charge` เท่านั้น
+
 รูปแบบไบต์: **little-endian, `__attribute__((packed))`** ตาม `Packets.h`
 
 ---
@@ -57,10 +60,17 @@
 
 ```c
 typedef struct __attribute__((packed)) {
-    uint8_t sys_command;    // 0=Normal, 1=Emergency Stop, 2=Force RTH
+    uint8_t sys_command;    // see CommandCode below
     int16_t manual_steer;   // -255..255
     int16_t manual_speed;   // -255..255
-} CommandPacket;            // 5 bytes
+} CommandPacket;            // 5 bytes (size unchanged)
+
+// CommandCode (sys_command):
+//   0 = CMD_NORMAL         clear force-RTH latch (does NOT clear E-Stop)
+//   1 = CMD_EMERGENCY_STOP latch E-Stop immediately
+//   2 = CMD_FORCE_RTH      force return-to-home
+//   3 = CMD_START_ARM      arm mission (needs waypoints + GPS + compass)
+//   4 = CMD_CLEAR_ESTOP    explicit clear of latched E-Stop -> STANDBY
 
 typedef struct __attribute__((packed)) { double lat; double lon; } Waypoint; // 16 bytes
 
@@ -94,9 +104,22 @@ typedef struct __attribute__((packed)) {
   ให้ gateway **ส่งซ้ำ** batch นั้น
 - **sequence_number** ใน telemetry เพิ่มขึ้นเรื่อย ๆ ฝั่ง gateway ควรทิ้งแพ็กเกจที่ `seq <=` ตัวก่อนหน้า
   (กัน replay) — ฝั่งเรือ stamp ค่านี้ให้อัตโนมัติ
-- **Emergency (`CMD_EMERGENCY_STOP` / `CMD_FORCE_RTH`)**: เรือจะยืนยันผ่าน `current_mode`
-  ใน telemetry ถัดไป (เช่นเปลี่ยนเป็น `4=EMERGENCY`) gateway ควรส่งซ้ำจนเห็นการยืนยัน
+- **Emergency (`CMD_EMERGENCY_STOP`)**: latch E-Stop; ยืนยันผ่าน `current_mode=4`
+  ต้องส่ง `CMD_CLEAR_ESTOP` ชัดเจนจึงปลดได้ (`CMD_NORMAL` / `CMD_START_ARM` ปลด E-Stop ไม่ได้)
+- `CMD_CLEAR_ESTOP` กลับสู่ STANDBY เท่านั้น และล้างคำสั่ง START/manual เดิม;
+  ต้องส่ง `CMD_START_ARM` ใหม่ภายหลัง ห้าม auto-resume
+- **Start (`CMD_START_ARM`)**: เริ่ม GRID เฉพาะเมื่อ mission upload ถูก seal แล้ว + GPS + compass พร้อม
+  (การอัป waypoint อย่างเดียวไม่ auto-start อีกต่อไป)
+- **Mission upload seal**: batch ที่ `waypoint_count < 12` ถือว่าจบอัตโนมัติ; ถ้า batch สุดท้ายเต็ม 12 จุด
+  ต้องส่ง `CMD_MISSION_UPLOAD_DONE (=5)` ก่อน START (ขนาด `CommandPacket` ยัง 5 bytes)
+- **Waypoint upload**: รับ batch ใหม่ได้เฉพาะตอน STANDBY; ระหว่าง GRID/SPIRAL/RTH จะ NACK
+- **Manual**: ใช้ stick จาก `CMD_NORMAL` เท่านั้น (คำสั่งอื่นไม่ทับ/ไม่เคลียร์ manual จาก stick=0)
+- **Force RTH (`CMD_FORCE_RTH`)**: เข้า RTH; เคลียร์ด้วย `CMD_NORMAL` หลังถึงบ้าน
+- **Manual timeout**: คำสั่ง manual ที่ไม่ refresh ภายใน 500 ms จะถูกตัดอัตโนมัติ
 - แพ็กเกจที่ขนาดไม่ตรง contract จะถูกทิ้ง (นับใน `droppedPackets`)
+- Waypoint batch ซ้ำ (packet_index เดิม) ได้ ACK แบบ idempotent; ข้ามลำดับได้ NACK
+- **TX confirm**: เรือรอ ESP-NOW send callback และ retry ได้ถึง `ESPNOW_TX_RETRIES` ครั้ง
+  (telemetry / waypoint ACK / battery report)
 
 ---
 

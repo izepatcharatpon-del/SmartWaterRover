@@ -12,33 +12,36 @@ struct GpsFix {
     bool    valid;
 };
 
-// Tiered response to GPS degradation (gps_drift_solutions.md).
+// GPS degradation policy (no dead reckoning — open-pond risk).
 enum class GpsLossTier {
-    NONE,            // fresh valid fix
-    DEAD_RECKONING,  // < 10s: coast on last heading/speed
-    SAFE_FLOAT,      // 10-60s: stop motors, hold position
-    EMERGENCY_RTH    // > 60s: escalate to safety layer
+    OK,           // loss timer has not reached SAFE_STOP; fix.valid is still freshness-gated
+    SAFE_STOP,    // temporary motor stop; resume when fix returns
+    GPS_FAULT     // latched prolonged loss — stop and escalate
 };
 
-// NEO-8M over UART2 with fix-quality gate, low-pass position filter and
-// "sea mode" dynamic model configuration (UBX-CFG-NAV5).
 class GpsModule {
 public:
     GpsModule();
 
     void        begin();
-    void        configureSeaMode();   // UBX dynamic model = Sea (5)
-    bool        update();             // pump serial bytes into parser
-    bool        isFixValid();         // sats>=6 && hdop<2.0
+    void        configureSeaMode();
+    bool        update();
+    bool        isFixValid();
+    bool        hasFreshFix();
+    bool        clearFaultIfFresh();
     GpsFix      getFilteredFix();
     GpsLossTier getLossTier();
     unsigned long timeSinceFix() const;
+    bool        hasTime() const;
+    int         localHour() const;   // 0-23 with configured timezone; -1 if unknown
 
 private:
     TinyGPSPlus   _gps;
     double        _filtLat, _filtLon;
     bool          _filterInit;
     unsigned long _lastValidFixMs;
+    bool          _everHadFix;
+    bool          _faultLatched;
 
     void applyLowPassFilter(double lat, double lon);
     void sendUbx(const uint8_t* msg, size_t len);
