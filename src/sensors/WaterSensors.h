@@ -11,6 +11,15 @@ struct WaterReading {
     bool  valid;
 };
 
+// 3-point pH cal @ 25 °C — buffers 4.01 / 6.86 / 9.18
+// Persisted in NVS namespace "usv_ph".
+struct PhCalibration {
+    float v401;      // voltage in pH 4.01 buffer
+    float v686;      // voltage in pH 6.86 buffer (neutral ref)
+    float v918;      // voltage in pH 9.18 buffer
+    bool  valid;
+};
+
 class WaterSensors {
 public:
     WaterSensors();
@@ -24,6 +33,34 @@ public:
     WaterReading readPh(float tempC);
     WaterReading readTurbidityNtu();
 
+    // --- pH calibration (buffers @ 25 °C) ---
+    bool  samplePhVoltage(float& outV, int samples = 30);
+    float readPhVoltage();
+
+    // Capture one buffer voltage (probe immersed & stable).
+    bool captureBuffer401(float& outV);  // pH 4.01
+    bool captureBuffer686(float& outV);  // pH 6.86
+    bool captureBuffer918(float& outV);  // pH 9.18
+
+    // Apply 3 voltages → piecewise slope cal. Expects V401 > V686 > V918.
+    bool calibrateThreePoint(float v401, float v686, float v918);
+
+    // Convenience: use last captured voltages (all three must be set).
+    bool applyCapturedCalibration();
+
+    void setCalibration(float v401, float v686, float v918);
+    void resetCalibration();
+    PhCalibration getCalibration() const { return _phCal; }
+    bool hasCaptured401() const { return _cap401; }
+    bool hasCaptured686() const { return _cap686; }
+    bool hasCaptured918() const { return _cap918; }
+    float captured401() const { return _vCap401; }
+    float captured686() const { return _vCap686; }
+    float captured918() const { return _vCap918; }
+
+    bool saveCalibration();
+    bool loadCalibration();
+
 private:
     Adafruit_ADS1115  _ads;
     OneWire           _oneWire;
@@ -32,8 +69,13 @@ private:
     float             _waterTemp;
     bool              _tempValid;
     bool              _adsReady;
+    PhCalibration     _phCal;
+
+    float _vCap401, _vCap686, _vCap918;
+    bool  _cap401, _cap686, _cap918;
 
     bool readChannelVoltage(uint8_t channel, float& outV);
+    float phFromVoltageCalibrated(float volts, float tempC) const;
 };
 
 #endif // USV_WATER_SENSORS_H

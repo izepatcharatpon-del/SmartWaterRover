@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <string.h>
 
 #include "config.h"
 #include "core/Tasks.h"
@@ -23,6 +25,28 @@ static SystemContext ctx;
 
 // TODO: replace with the shore/gateway board's real MAC.
 static uint8_t GATEWAY_MAC[6] = {0x24, 0x6F, 0x28, 0x00, 0x00, 0x01};
+static const uint8_t DUMMY_GATEWAY_MAC[6] = {0x24, 0x6F, 0x28, 0x00, 0x00, 0x01};
+
+static void printMac(const char* label, const uint8_t mac[6]) {
+    Serial.printf("[USV] %s %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  label, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void printPairingBanner(bool commsOk) {
+    uint8_t selfMac[6] = {0};
+    WiFi.macAddress(selfMac);
+    printMac("boat MAC  (give to gateway)", selfMac);
+    printMac("peer MAC  (GATEWAY_MAC)", GATEWAY_MAC);
+    if (memcmp(GATEWAY_MAC, DUMMY_GATEWAY_MAC, 6) == 0) {
+        Serial.println(F("[USV] GATEWAY_MAC is still DUMMY — RX will drop the real gateway"));
+    }
+    Serial.printf("[USV] ESP-NOW ch=%u LR+encrypt %s\n",
+                  (unsigned)ESPNOW_WIFI_CHANNEL,
+                  commsOk ? "init OK" : "INIT FAIL");
+    Serial.println(F("[USV] gateway must match: Packets.h sizes 5/194/38/2/20/12"));
+    Serial.println(F("[USV] CMD 0=NORMAL 1=ESTOP 2=RTH 3=START_ARM 4=CLEAR_ESTOP 5=UPLOAD_DONE"));
+    Serial.println(F("[USV] indoor: no GPS => STANDBY + motors stopped. Pass = telemetry ~1 Hz"));
+}
 
 static void haltFatal(const char* msg) {
     Serial.println(msg);
@@ -43,6 +67,14 @@ void setup() {
     const bool waterOk = water.begin();
     if (!waterOk) {
         Serial.println(F("[USV] ADS1115 init FAILED — anomaly detection disabled"));
+    } else {
+        PhCalibration pc = water.getCalibration();
+        if (pc.valid) {
+            Serial.printf("[USV] pH cal OK  V4.01=%.3f V6.86=%.3f V9.18=%.3f\n",
+                          pc.v401, pc.v686, pc.v918);
+        } else {
+            Serial.println(F("[USV] pH cal not set — using default Nernst (run 3-point cal)"));
+        }
     }
     battery.begin();
     if (compass.begin()) {
@@ -55,7 +87,9 @@ void setup() {
     gps.configureSeaMode();
     motor.begin();
     const bool loggerOk = logger.begin();
-    if (!loggerOk) {
+    if (loggerOk) {
+        Serial.println(F("[USV] SD logger OK (SdFat)"));
+    } else {
         // SD is optional: boat must still run without a card. ioTask skips
         // logRecord when logger is null / not ready.
         Serial.println(F("[USV] SD logger init FAILED — continuing without SD"));
@@ -69,6 +103,7 @@ void setup() {
     if (!commsOk) {
         Serial.println(F("[USV] ESP-NOW init FAILED"));
     }
+    printPairingBanner(commsOk);
 
     fsm.begin();
 
@@ -84,12 +119,15 @@ void setup() {
     ctx.batteryVoltage = VOLTAGE_FULL;
     ctx.logDropCount = 0;
     ctx.ackDropCount = 0;
+    ctx.stageDropCount = 0;
 
     ctx.logQueue   = xQueueCreate(16, sizeof(TelemetryPacket));
+    ctx.stageQueue = xQueueCreate(STAGE_STATUS_QUEUE_LENGTH,
+                                  sizeof(StageStatusPacket));
     ctx.stateMutex = xSemaphoreCreateMutex();
 
-    // Logging failure must not prevent navigation / motor control tasks.
-    if (!commsOk || !ctx.logQueue || !ctx.stateMutex) {
+    // RTOS queues/mutex are required; the SD device itself remains optional.
+    if (!commsOk || !ctx.logQueue || !ctx.stageQueue || !ctx.stateMutex) {
         haltFatal("[FATAL] init failed (comms/queue/mutex)");
     }
 

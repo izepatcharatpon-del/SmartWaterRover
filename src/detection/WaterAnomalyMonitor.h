@@ -8,8 +8,10 @@ public:
     WaterAnomalyMonitor();
 
     // Returns true if spiral should trigger (after hysteresis / cooldown).
+    // motionDisturbance: recent hard thrust / turn — ROC-only spikes ignored.
     bool updateReadings(float ph, float turbidity, float temp,
-                        bool sensorsValid, int hour = -1);
+                        bool sensorsValid, int hour = -1,
+                        bool motionDisturbance = false);
 
     bool shouldTriggerSpiral() const { return _triggerSpiral; }
 
@@ -35,6 +37,8 @@ private:
     float _anomalyScore;
     float _turbRoc;
     unsigned long _cooldownUntil;
+    unsigned long _baselineHighSince;
+    bool  _baselineHighActive;
 
     float sma(const float* buf) const;
     float phHighLimitForHour(int hour) const;

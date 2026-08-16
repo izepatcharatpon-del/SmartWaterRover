@@ -49,6 +49,8 @@ public:
     }
     int      count() const { return _count; }
     int      index() const { return _index; }
+    bool     uploadComplete() const { return _missionUploadComplete; }
+    uint8_t  expectedPacketIndex() const { return _expectedPacketIndex; }
 
     // Idempotent multi-batch upload. Mid-mission (!allowNewMission) rejects
     // all new batches; identical last-packet retries still ACK.

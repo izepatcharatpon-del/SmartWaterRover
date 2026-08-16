@@ -1,12 +1,12 @@
 #include "DataLogger.h"
 #include "config.h"
 #include <SPI.h>
-#include <SD.h>
+#include <SdFat.h>
 #include <stdio.h>
 
-// Single logger instance -> keep the open file handle at file scope so the
-// header need not pull in <SD.h>.
-static File     g_logFile;
+// SdFat — Arduino SD.h fails ACMD41 on this ESP32-S3 + module combo (bench).
+static SdFat   g_sd;
+static FsFile  g_logFile;
 static SPIClass g_spi(HSPI);
 
 static const char* CSV_HEADER =
@@ -19,8 +19,8 @@ DataLogger::DataLogger()
 }
 
 void DataLogger::openAndWriteHeader() {
-    bool isNew = !SD.exists(_filename);
-    g_logFile = SD.open(_filename, FILE_APPEND);
+    bool isNew = !g_sd.exists(_filename);
+    g_logFile = g_sd.open(_filename, O_RDWR | O_CREAT | O_AT_END);
     if (g_logFile && isNew) {
         g_logFile.print(CSV_HEADER);
         g_logFile.flush();
@@ -31,8 +31,36 @@ bool DataLogger::begin() {
     _spiMutex = xSemaphoreCreateMutex();
     if (!_spiMutex) return false;
 
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, HIGH);
+    pinMode(SD_MISO_PIN, INPUT_PULLUP);
+
+    g_spi.end();
+    delay(20);
     g_spi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-    if (!SD.begin(SD_CS_PIN, g_spi)) {
+    delay(200);
+
+    // ≥80 idle clocks with CS high before first CMD (helps ACMD41).
+    g_spi.beginTransaction(SPISettings(100000, MSBFIRST, SPI_MODE0));
+    for (int i = 0; i < 16; i++) g_spi.transfer(0xFF);
+    g_spi.endTransaction();
+    delay(10);
+
+    bool mounted = false;
+    static const uint32_t kHzList[] = { 400000UL, 1000000UL, 100000UL, 4000000UL };
+    for (uint8_t i = 0; i < 4 && !mounted; i++) {
+        g_sd.end();
+        if (!g_sd.cardBegin(SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, kHzList[i], &g_spi))) {
+            if (!g_sd.cardBegin(SdSpiConfig(SD_CS_PIN, SHARED_SPI, kHzList[i], &g_spi))) {
+                continue;
+            }
+        }
+        if (g_sd.volumeBegin()) {
+            mounted = true;
+        }
+    }
+
+    if (!mounted) {
         _ready = false;
         return false;
     }
@@ -80,7 +108,8 @@ bool DataLogger::logRecord(const TelemetryPacket& pkt) {
 bool DataLogger::checkIntegrity() {
     if (!_spiMutex) return false;
     if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
-    bool ok = (SD.cardType() != CARD_NONE) && (bool)g_logFile && _ready;
+    bool cardOk = g_sd.card() && g_sd.card()->errorCode() == 0;
+    bool ok = cardOk && (bool)g_logFile && _ready;
     if (!ok) {
         _ready = false;
     }

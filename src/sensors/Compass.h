@@ -25,6 +25,7 @@ private:
     bool writeRegister(uint8_t reg, uint8_t value);
     bool readRegisters(uint8_t reg, uint8_t* buf, uint8_t len);
     float applyDeclination(float headingDeg);
+    void  applyHardIron(float rawX, float rawY, float& outX, float& outY) const;
 };
 
 #endif // USV_COMPASS_H

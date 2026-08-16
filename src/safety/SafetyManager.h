@@ -16,7 +16,8 @@ class SafetyManager {
 public:
     SafetyManager();
 
-    SafetyState evaluate(float batteryV);
+    // underPropulsionLoad: pack sag expected — use VOLTAGE_RTH_LOADED.
+    SafetyState evaluate(float batteryV, bool underPropulsionLoad = false);
 
 private:
     SafetyState _state;

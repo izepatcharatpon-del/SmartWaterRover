@@ -9,7 +9,9 @@ WaterAnomalyMonitor::WaterAnomalyMonitor()
       _haveLastTurb(false),
       _rawAnomaly(false),
       _triggerSpiral(false), _anomalyScore(0.0f), _turbRoc(0.0f),
-      _cooldownUntil(0) {
+      _cooldownUntil(0),
+      _baselineHighSince(0),
+      _baselineHighActive(false) {
     for (int i = 0; i < SMA_WINDOW; i++) { _phBuf[i] = 7.0f; _turbBuf[i] = 0.0f; }
     _lastSampleTime = millis();
     _lastRocMs = _lastSampleTime;
@@ -24,12 +26,15 @@ float WaterAnomalyMonitor::sma(const float* buf) const {
 }
 
 float WaterAnomalyMonitor::phHighLimitForHour(int hour) const {
+    // Unknown GPS time: use day (looser) ceiling to avoid dawn false spirals.
+    if (hour < 0) return PH_HIGH_LIMIT_DAY;
     if (hour >= 12 && hour < 17) return PH_HIGH_LIMIT_DAY;
     return PH_HIGH_LIMIT_NIGHT;
 }
 
 bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
-                                         bool sensorsValid, int hour) {
+                                         bool sensorsValid, int hour,
+                                         bool motionDisturbance) {
     // Sensor fault: suppress trigger but keep Schmitt latch (avoid glitch reset).
     if (!sensorsValid) {
         _triggerSpiral = false;
@@ -72,6 +77,24 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
     bool phOut   = (phAvg < PH_LOW_LIMIT) || (phAvg > phHigh);
     bool turbHigh = (turbAvg > TURBIDITY_WASTEWATER_NTU);
     bool turbSpike = (_turbRoc > TURBIDITY_ROC_LIMIT);
+    if (motionDisturbance) {
+        // Prop wash / hard turns often spike ROC without real wastewater.
+        turbSpike = false;
+    }
+
+    // Sustained rise above slow baseline (catches slow pollution < absolute NTU).
+    bool baselineRising = (baselineDev > ANOMALY_BASELINE_DELTA_NTU);
+    if (baselineRising) {
+        if (!_baselineHighActive) {
+            _baselineHighActive = true;
+            _baselineHighSince = now;
+        }
+    } else {
+        _baselineHighActive = false;
+    }
+    bool baselineDwell =
+        _baselineHighActive &&
+        (now - _baselineHighSince >= ANOMALY_BASELINE_DWELL_MS);
 
     // Score is telemetry/debug only — ammonia equilibrium fraction is NOT a
     // standalone trigger (needs real TAN; pH alone already covers chemistry).
@@ -83,15 +106,16 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
     if (baselineDev > 0.0f) score += fminf(baselineDev / 50.0f, 0.3f);
     if (phOut)     score += 0.3f;
     if (turbSpike) score += 0.3f;
+    if (baselineDwell) score += 0.2f;
     _anomalyScore = fminf(score, 1.5f);
 
     const float turbClearLevel =
         TURBIDITY_WASTEWATER_NTU - ANOMALY_CLEAR_HYST_NTU;
     if (_rawAnomaly) {
         const bool turbStillHigh = (turbAvg > turbClearLevel);
-        _rawAnomaly = turbStillHigh || turbSpike || phOut;
+        _rawAnomaly = turbStillHigh || turbSpike || phOut || baselineDwell;
     } else {
-        _rawAnomaly = turbHigh || turbSpike || phOut;
+        _rawAnomaly = turbHigh || turbSpike || phOut || baselineDwell;
     }
 
     if (_rawAnomaly) {
@@ -108,4 +132,5 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
 void WaterAnomalyMonitor::notifySpiralDone() {
     _triggerSpiral = false;
     _cooldownUntil = millis() + ANOMALY_COOLDOWN_MS;
+    _baselineHighActive = false;
 }

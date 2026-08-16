@@ -4,24 +4,47 @@
 
 BatteryMonitor::BatteryMonitor()
     : _lastVoltage(VOLTAGE_FULL),
-      _saneFailCount(0) {}
+      _filtVoltage(VOLTAGE_FULL),
+      _emaInit(false),
+      _saneFailCount(0),
+      _outOfRangeLogged(false) {}
 
 void BatteryMonitor::begin() {
     analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
     _saneFailCount = 0;
+    _emaInit = false;
+    _outOfRangeLogged = false;
 }
 
 float BatteryMonitor::readVoltage() {
     uint32_t mv = analogReadMilliVolts(BATTERY_ADC_PIN);
     float v = (mv / 1000.0f) * BATTERY_DIVIDER_RATIO;
     if (isfinite(v) && v >= VOLTAGE_SANE_MIN && v <= VOLTAGE_SANE_MAX) {
-        _lastVoltage = v;
+        if (_outOfRangeLogged) {
+            Serial.println(F("[USV] battery ADC recovered — voltage in sane range"));
+            _outOfRangeLogged = false;
+        }
         _saneFailCount = 0;
+        if (!_emaInit) {
+            _filtVoltage = v;
+            _emaInit = true;
+        } else {
+            _filtVoltage = BATTERY_VOLTAGE_EMA_ALPHA * v +
+                           (1.0f - BATTERY_VOLTAGE_EMA_ALPHA) * _filtVoltage;
+        }
+        _lastVoltage = _filtVoltage;
     } else {
         if (_saneFailCount < 255) _saneFailCount++;
         // Open-wire must not freeze at boot-time FULL.
         if (_saneFailCount >= 10) {
             _lastVoltage = VOLTAGE_CRITICAL;
+            _filtVoltage = VOLTAGE_CRITICAL;
+            _emaInit = true;
+            if (!_outOfRangeLogged) {
+                Serial.println(F("[USV] battery ADC out of range x10 — latching CRITICAL"));
+                Serial.println(F("[USV] connect the 3S pack; mode=4 here is NOT a radio failure"));
+                _outOfRangeLogged = true;
+            }
         }
     }
     return _lastVoltage;

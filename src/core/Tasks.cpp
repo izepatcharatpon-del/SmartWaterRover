@@ -1,4 +1,5 @@
 #include "core/Tasks.h"
+#include "core/StageReporter.h"
 #include "config.h"
 #include <math.h>
 #include <string.h>
@@ -33,6 +34,11 @@ void navigationTask(void* pv) {
     uint32_t logSequence = 0;
     Waypoint lastLosTarget = {0.0, 0.0};
     bool haveLastLosTarget = false;
+    StageStatusPacket lastStageStatus = {};
+    bool haveLastStageStatus = false;
+    unsigned long lastHardThrustMs = 0;
+    int lastAbsPwm = 0;
+    bool hadHardThrust = false;
 
     TickType_t lastWake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(NAV_LOOP_PERIOD_MS);
@@ -66,13 +72,17 @@ void navigationTask(void* pv) {
         int hour = ctx->gps->localHour();
 
         // ---- 2. Water ADS + anomaly (rate-limited) ----
+        const bool motionDisturbance =
+            hadHardThrust &&
+            (millis() - lastHardThrustMs) < ANOMALY_DISTURBANCE_MS;
         if (waterAdsDiv == 0) {
             phR   = ctx->water->readPh(temp);
             turbR = ctx->water->readTurbidityNtu();
             const bool sensorsValid =
                 phR.valid && turbR.valid && ctx->water->tempValid();
             anomaly = ctx->anomaly->updateReadings(
-                phR.value, turbR.value, temp, sensorsValid, hour);
+                phR.value, turbR.value, temp, sensorsValid, hour,
+                motionDisturbance);
         } else if (!phR.valid || !turbR.valid || !ctx->water->tempValid()) {
             // Brief sensor glitch: suppress trigger only — do not call
             // updateReadings(false) which would wipe Schmitt hysteresis.
@@ -175,8 +185,10 @@ void navigationTask(void* pv) {
             }
         }
 
-        // ---- 5. Safety (AA118 voltage only) ----
-        SafetyState safety = ctx->safety->evaluate(battV);
+        // ---- 5. Safety (AA118 voltage only; load-aware RTH threshold) ----
+        const bool underLoad = (lastAbsPwm >= BATTERY_LOAD_PWM_THRESH) ||
+                               motionDisturbance;
+        SafetyState safety = ctx->safety->evaluate(battV, underLoad);
 
         // ---- 6. Mission FSM ----
         GpsLossTier gpsTier = ctx->gps->getLossTier();
@@ -282,6 +294,32 @@ void navigationTask(void* pv) {
             }
             spiralDone = false;
             g_spiralInitialized = false;
+        }
+
+        // Announce stage/intent edges. current_mode in telemetry remains the
+        // 1 Hz heartbeat; this event adds why/next/upload progress.
+        StageReportContext stageCtx = {};
+        stageCtx.previousState = prevState;
+        stageCtx.currentState = state;
+        stageCtx.fsm = in;
+        stageCtx.initialReport = !haveLastStageStatus;
+        stageCtx.manualMode = cmd.manualMode;
+        stageCtx.uploadComplete = ctx->nav->uploadComplete();
+        stageCtx.homeSet = g_homeSet;
+        stageCtx.waypointCount = (uint8_t)ctx->nav->count();
+        stageCtx.waypointIndex = (uint8_t)ctx->nav->index();
+        stageCtx.expectedBatchIndex = ctx->nav->expectedPacketIndex();
+
+        StageStatusPacket stageStatus = StageReporter::build(stageCtx);
+        if (!haveLastStageStatus ||
+            !StageReporter::sameStatus(stageStatus, lastStageStatus)) {
+            if (ctx->stageQueue &&
+                xQueueSend(ctx->stageQueue, &stageStatus, 0) == pdTRUE) {
+                lastStageStatus = stageStatus;
+                haveLastStageStatus = true;
+            } else {
+                ctx->stageDropCount++;
+            }
         }
 
         // ---- 7. Act on state ----
@@ -406,6 +444,17 @@ void navigationTask(void* pv) {
             !fix.valid ||
             !compassOk) {
             ctx->motor->stop();
+            leftPwm = 0;
+            rightPwm = 0;
+        }
+
+        // Track propulsion for battery sag + anomaly disturbance gating.
+        const int absL = leftPwm < 0 ? -leftPwm : leftPwm;
+        const int absR = rightPwm < 0 ? -rightPwm : rightPwm;
+        lastAbsPwm = absL > absR ? absL : absR;
+        if (lastAbsPwm >= BATTERY_LOAD_PWM_THRESH) {
+            lastHardThrustMs = millis();
+            hadHardThrust = true;
         }
 
         // ---- 8. Publish telemetry snapshot (under mutex) ----
@@ -413,8 +462,8 @@ void navigationTask(void* pv) {
         memset(&logRec, 0, sizeof(logRec));
         bool snapshotPublished = false;
         if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            ctx->snapshot.gps_lat         = fix.lat;
-            ctx->snapshot.gps_lon         = fix.lon;
+            ctx->snapshot.gps_lat         = fix.valid ? fix.lat : NAN;
+            ctx->snapshot.gps_lon         = fix.valid ? fix.lon : NAN;
             ctx->snapshot.water_ph        = phR.valid ? phR.value : NAN;
             ctx->snapshot.water_turbidity = turbR.valid ? turbR.value : NAN;
             ctx->snapshot.water_temp      = ctx->water->tempValid() ? temp : NAN;
@@ -451,6 +500,7 @@ void ioTask(void* pv) {
     unsigned long lastTelemetry = 0;
     unsigned long lastBattReport = 0;
     unsigned long lastSdCheck = 0;
+    unsigned long lastRadioDiag = 0;
 
     for (;;) {
         // ---- Drain inbound command queue ----
@@ -528,8 +578,18 @@ void ioTask(void* pv) {
             ctx->link->sendAck(ack);
         }
 
-        // ---- Periodic telemetry TX ----
+        // ---- Drain stage/intent events from nav -> shore ----
+        StageStatusPacket stageStatus;
+        while (ctx->stageQueue &&
+               xQueueReceive(ctx->stageQueue, &stageStatus, 0) == pdTRUE) {
+            if (!ctx->link->sendStageStatus(stageStatus)) {
+                ctx->stageDropCount++;
+            }
+        }
+
+        // ---- Periodic telemetry TX (1 Hz even if a send fails — do not spin) ----
         if (millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
+            lastTelemetry = millis();
             TelemetryPacket tp;
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 tp = ctx->snapshot;
@@ -541,7 +601,6 @@ void ioTask(void* pv) {
                         ctx->snapshot.sequence_number = tp.sequence_number;
                         xSemaphoreGive(ctx->stateMutex);
                     }
-                    lastTelemetry = millis();
                 }
             }
         }
@@ -581,6 +640,18 @@ void ioTask(void* pv) {
             if (!ctx->logger->checkIntegrity()) {
                 Serial.println(F("[USV] SD integrity FAIL — logging paused"));
             }
+        }
+
+        if (millis() - lastRadioDiag >= RADIO_DIAG_MS) {
+            lastRadioDiag = millis();
+            Serial.printf(
+                "[USV] radio rxDrop=%lu isrDrop=%lu txFail=%lu ackDrop=%lu stageDrop=%lu logDrop=%lu\n",
+                (unsigned long)EspNowLink::droppedPackets,
+                (unsigned long)EspNowLink::droppedIsrPackets,
+                (unsigned long)EspNowLink::txFailCount,
+                (unsigned long)ctx->ackDropCount,
+                (unsigned long)ctx->stageDropCount,
+                (unsigned long)ctx->logDropCount);
         }
 
         ctx->wdt->feed();

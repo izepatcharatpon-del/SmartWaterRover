@@ -8,6 +8,7 @@
 #include "navigation/SpiralPlanner.h"
 #include "control/PidController.h"
 #include "core/MissionFsm.h"
+#include "core/StageReporter.h"
 #include "safety/SafetyManager.h"
 #include "config.h"
 
@@ -388,6 +389,11 @@ void test_safety_critical_and_rth(void) {
     TEST_ASSERT_EQUAL((int)SafetyState::LOW_BATTERY_RTH, (int)s.evaluate(10.4f));
     TEST_ASSERT_EQUAL((int)SafetyState::LOW_BATTERY_RTH, (int)s.evaluate(10.6f));
     TEST_ASSERT_EQUAL((int)SafetyState::NORMAL, (int)s.evaluate(10.8f));
+
+    // Under load, 10.4 V is still above VOLTAGE_RTH_LOADED (10.3) → stay NORMAL.
+    s = SafetyManager();
+    TEST_ASSERT_EQUAL((int)SafetyState::NORMAL, (int)s.evaluate(10.4f, true));
+    TEST_ASSERT_EQUAL((int)SafetyState::LOW_BATTERY_RTH, (int)s.evaluate(10.2f, true));
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +408,111 @@ static FsmInputs baseInputs() {
     in.homeSet = true;
     in.safety = SafetyState::NORMAL;
     return in;
+}
+
+// ---------------------------------------------------------------------------
+// Stage / intent reporting
+// ---------------------------------------------------------------------------
+void test_stage_reporter_waits_for_complete_upload(void) {
+    StageReportContext ctx = {};
+    ctx.previousState = STATE_STANDBY;
+    ctx.currentState = STATE_STANDBY;
+    ctx.fsm = baseInputs();
+    ctx.fsm.hasWaypoints = false;
+    ctx.initialReport = true;
+
+    StageStatusPacket status = StageReporter::build(ctx);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_INTENT_WAIT_WAYPOINT_BATCH, status.intent);
+    TEST_ASSERT_EQUAL_UINT8(STATE_GRID_PATROL, status.next_stage);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_REASON_BOOT, status.reason);
+
+    ctx.initialReport = false;
+    ctx.waypointCount = 12;
+    ctx.waypointIndex = 0;
+    ctx.expectedBatchIndex = 1;
+    ctx.uploadComplete = false;
+    status = StageReporter::build(ctx);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_INTENT_WAIT_MISSION_SEAL, status.intent);
+    TEST_ASSERT_EQUAL_UINT8(12, status.waypoint_count);
+    TEST_ASSERT_EQUAL_UINT8(1, status.expected_batch_index);
+    TEST_ASSERT_EQUAL_UINT8(0, status.flags & STAGE_FLAG_MISSION_READY);
+}
+
+void test_stage_reporter_start_waits_for_nav_ready(void) {
+    StageReportContext ctx = {};
+    ctx.previousState = STATE_STANDBY;
+    ctx.currentState = STATE_STANDBY;
+    ctx.fsm = baseInputs();
+    ctx.fsm.startCommand = true;
+    ctx.fsm.gpsOk = false;
+    ctx.uploadComplete = true;
+    ctx.waypointCount = 3;
+
+    StageStatusPacket status = StageReporter::build(ctx);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_INTENT_WAIT_NAV_READY, status.intent);
+    TEST_ASSERT_BITS_HIGH(STAGE_FLAG_UPLOAD_COMPLETE |
+                          STAGE_FLAG_MISSION_READY |
+                          STAGE_FLAG_START_PENDING,
+                          status.flags);
+    TEST_ASSERT_EQUAL_UINT8(0, status.flags & STAGE_FLAG_GPS_READY);
+}
+
+void test_stage_reporter_transition_reasons(void) {
+    StageReportContext ctx = {};
+    ctx.fsm = baseInputs();
+    ctx.uploadComplete = true;
+    ctx.homeSet = true;
+    ctx.waypointCount = 3;
+
+    ctx.previousState = STATE_STANDBY;
+    ctx.currentState = STATE_GRID_PATROL;
+    ctx.fsm.startCommand = true;
+    StageStatusPacket status = StageReporter::build(ctx);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_INTENT_PATROL_WAYPOINT, status.intent);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_REASON_START_ACCEPTED, status.reason);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_NEXT_DYNAMIC, status.next_stage);
+
+    ctx.previousState = STATE_GRID_PATROL;
+    ctx.currentState = STATE_SPIRAL_MAPPING;
+    ctx.fsm.startCommand = false;
+    ctx.fsm.anomalyDetected = true;
+    status = StageReporter::build(ctx);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_INTENT_MAP_ANOMALY, status.intent);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_REASON_ANOMALY_DETECTED, status.reason);
+    TEST_ASSERT_EQUAL_UINT8(STATE_GRID_PATROL, status.next_stage);
+
+    ctx.previousState = STATE_SPIRAL_MAPPING;
+    ctx.currentState = STATE_EMERGENCY_STOP;
+    ctx.initialReport = true;
+    ctx.fsm.anomalyDetected = false;
+    ctx.fsm.emergencyCommand = true;
+    status = StageReporter::build(ctx);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_INTENT_WAIT_CLEAR_ESTOP, status.intent);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_REASON_EMERGENCY_COMMAND, status.reason);
+    TEST_ASSERT_EQUAL_UINT8(STATE_STANDBY, status.next_stage);
+}
+
+void test_stage_reporter_edge_filter_ignores_readiness_chatter(void) {
+    StageReportContext ctx = {};
+    ctx.previousState = STATE_STANDBY;
+    ctx.currentState = STATE_STANDBY;
+    ctx.fsm = baseInputs();
+    ctx.uploadComplete = true;
+    ctx.waypointCount = 3;
+
+    StageStatusPacket a = StageReporter::build(ctx);
+    ctx.fsm.gpsOk = false;
+    StageStatusPacket b = StageReporter::build(ctx);
+    TEST_ASSERT_TRUE(StageReporter::sameStatus(a, b));
+
+    ctx.fsm.startCommand = true;
+    b = StageReporter::build(ctx);
+    TEST_ASSERT_FALSE(StageReporter::sameStatus(a, b));
+
+    ctx.fsm.startCommand = false;
+    ctx.waypointCount = 4;
+    b = StageReporter::build(ctx);
+    TEST_ASSERT_FALSE(StageReporter::sameStatus(a, b));
 }
 
 void test_fsm_rth_arrives_home_despite_low_battery(void) {
@@ -534,6 +645,10 @@ int main(int, char**) {
     RUN_TEST(test_pid_angular_wrap_no_spike);
     RUN_TEST(test_pid_reset_clears_integral);
     RUN_TEST(test_safety_critical_and_rth);
+    RUN_TEST(test_stage_reporter_waits_for_complete_upload);
+    RUN_TEST(test_stage_reporter_start_waits_for_nav_ready);
+    RUN_TEST(test_stage_reporter_transition_reasons);
+    RUN_TEST(test_stage_reporter_edge_filter_ignores_readiness_chatter);
     RUN_TEST(test_fsm_rth_arrives_home_despite_low_battery);
     RUN_TEST(test_fsm_estop_requires_clear);
     RUN_TEST(test_fsm_clear_ignored_outside_estop);

@@ -19,6 +19,7 @@ uint32_t      EspNowLink::droppedPackets = 0;
 uint32_t      EspNowLink::droppedIsrPackets = 0;
 uint32_t      EspNowLink::txFailCount  = 0;
 uint32_t      EspNowLink::txSequence   = 0;
+uint32_t      EspNowLink::stageSequence = 0;
 uint8_t       EspNowLink::_peerMac[6]  = {0};
 EventGroupHandle_t EspNowLink::_safetyEvents = nullptr;
 SemaphoreHandle_t  EspNowLink::_txDone = nullptr;
@@ -143,6 +144,11 @@ bool EspNowLink::sendAck(const WaypointACKPacket& pkt) {
 }
 
 bool EspNowLink::sendBatteryReport(const BatteryReportPacket& pkt) {
+    return sendWithConfirm((const uint8_t*)&pkt, sizeof(pkt));
+}
+
+bool EspNowLink::sendStageStatus(StageStatusPacket& pkt) {
+    pkt.sequence_number = ++stageSequence;
     return sendWithConfirm((const uint8_t*)&pkt, sizeof(pkt));
 }
 

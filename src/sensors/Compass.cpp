@@ -93,12 +93,27 @@ float Compass::applyDeclination(float headingDeg) {
     return h;
 }
 
+void Compass::applyHardIron(float rawX, float rawY, float& outX, float& outY) const {
+    const float xSpan = COMPASS_X_MAX - COMPASS_X_MIN;
+    const float ySpan = COMPASS_Y_MAX - COMPASS_Y_MIN;
+    // Default equal ±2048 → centered unit circle (identity-ish scale).
+    if (xSpan < 1.0f || ySpan < 1.0f) {
+        outX = rawX;
+        outY = rawY;
+        return;
+    }
+    const float xOff = 0.5f * (COMPASS_X_MIN + COMPASS_X_MAX);
+    const float yOff = 0.5f * (COMPASS_Y_MIN + COMPASS_Y_MAX);
+    outX = (rawX - xOff) / (0.5f * xSpan);
+    outY = (rawY - yOff) / (0.5f * ySpan);
+}
+
 float Compass::getHeadingDeg() {
     if (!_fresh) return NAN;
 
-    float x = (float)_rawX;
-    float y = (float)_rawY;
-    if ((x * x + y * y) < 1.0f) return NAN;
+    float x = 0.0f, y = 0.0f;
+    applyHardIron((float)_rawX, (float)_rawY, x, y);
+    if ((x * x + y * y) < 1e-6f) return NAN;
 
     float heading = atan2f(y, x) * 180.0f / (float)M_PI;
     if (heading < 0.0f) heading += 360.0f;

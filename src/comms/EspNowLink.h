@@ -16,6 +16,7 @@ public:
     bool sendTelemetry(TelemetryPacket& pkt);
     bool sendAck(const WaypointACKPacket& pkt);
     bool sendBatteryReport(const BatteryReportPacket& pkt);
+    bool sendStageStatus(StageStatusPacket& pkt);
 
     // Inbound queues — drained by navigation task (waypoints) / IO task (commands).
     static QueueHandle_t commandQueue;
@@ -33,7 +34,8 @@ public:
 
 private:
     static uint8_t  _peerMac[6];
-    static uint32_t txSequence; // IO-task owned
+    static uint32_t txSequence;    // telemetry stream, IO-task owned
+    static uint32_t stageSequence; // stage event stream, IO-task owned
     static EventGroupHandle_t _safetyEvents;
     static SemaphoreHandle_t  _txDone;
     static volatile bool      _txOk;

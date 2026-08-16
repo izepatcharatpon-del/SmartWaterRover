@@ -61,6 +61,64 @@ typedef struct __attribute__((packed)) {
     float    estimated_tte_min;
 } BatteryReportPacket;
 
+// Mission stage / intent event (12 bytes). Sent on status edges; telemetry
+// current_mode remains the 1 Hz heartbeat if this event is lost.
+typedef struct __attribute__((packed)) {
+    uint32_t sequence_number;     // monotonic within StageStatusPacket stream
+    uint8_t  current_stage;       // BoatState value: 0..4
+    uint8_t  intent;              // StageIntentCode
+    uint8_t  next_stage;          // BoatState value or STAGE_NEXT_DYNAMIC
+    uint8_t  reason;              // StageReasonCode
+    uint8_t  flags;               // StageStatusFlags bitmask
+    uint8_t  waypoint_count;      // total accepted points: 0..64
+    uint8_t  waypoint_index;      // active point (0-based), ==count when done
+    uint8_t  expected_batch_index;// next WaypointArrayPacket index
+} StageStatusPacket;
+
+enum StageIntentCode {
+    STAGE_INTENT_WAIT_WAYPOINT_BATCH = 0,
+    STAGE_INTENT_WAIT_MISSION_SEAL   = 1,
+    STAGE_INTENT_WAIT_START          = 2,
+    STAGE_INTENT_WAIT_NAV_READY      = 3,
+    STAGE_INTENT_PATROL_WAYPOINT     = 4,
+    STAGE_INTENT_MANUAL_CONTROL      = 5,
+    STAGE_INTENT_MAP_ANOMALY         = 6,
+    STAGE_INTENT_RETURN_HOME         = 7,
+    STAGE_INTENT_WAIT_CLEAR_ESTOP    = 8,
+    STAGE_INTENT_WAIT_SAFETY_CLEAR   = 9
+};
+
+enum StageReasonCode {
+    STAGE_REASON_BOOT               = 0,
+    STAGE_REASON_STATUS_UPDATE      = 1,
+    STAGE_REASON_START_ACCEPTED     = 2,
+    STAGE_REASON_ANOMALY_DETECTED   = 3,
+    STAGE_REASON_SPIRAL_COMPLETE    = 4,
+    STAGE_REASON_MISSION_COMPLETE   = 5,
+    STAGE_REASON_FORCE_RTH          = 6,
+    STAGE_REASON_LOW_BATTERY        = 7,
+    STAGE_REASON_EMERGENCY_COMMAND  = 8,
+    STAGE_REASON_GPS_FAULT          = 9,
+    STAGE_REASON_CRITICAL_SAFETY    = 10,
+    STAGE_REASON_ARRIVED_HOME       = 11,
+    STAGE_REASON_CLEAR_ESTOP        = 12
+};
+
+enum StageStatusFlags {
+    STAGE_FLAG_UPLOAD_COMPLETE = (1U << 0),
+    STAGE_FLAG_MISSION_READY   = (1U << 1),
+    STAGE_FLAG_START_PENDING   = (1U << 2),
+    STAGE_FLAG_GPS_READY       = (1U << 3),
+    STAGE_FLAG_COMPASS_READY   = (1U << 4),
+    STAGE_FLAG_HOME_SET        = (1U << 5),
+    STAGE_FLAG_MANUAL_ACTIVE   = (1U << 6),
+    STAGE_FLAG_SAFETY_NORMAL   = (1U << 7)
+};
+
+enum {
+    STAGE_NEXT_DYNAMIC = 0xFF
+};
+
 // ---------- Command codes -----------------------------------------------------
 // Wire size of CommandPacket stays 5 bytes; only the meaning of sys_command grows.
 enum CommandCode {
@@ -87,6 +145,7 @@ static_assert(sizeof(WaypointArrayPacket)== 194, "WaypointArrayPacket must be 19
 static_assert(sizeof(WaypointACKPacket)  == 2,   "WaypointACKPacket must be 2 bytes");
 static_assert(sizeof(TelemetryPacket)    == 38,  "TelemetryPacket must be 38 bytes");
 static_assert(sizeof(BatteryReportPacket)== 20,  "BatteryReportPacket must be 20 bytes");
+static_assert(sizeof(StageStatusPacket)  == 12,  "StageStatusPacket must be 12 bytes");
 #endif
 
 #endif // USV_PACKETS_H

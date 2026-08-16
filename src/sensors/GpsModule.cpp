@@ -1,5 +1,6 @@
 #include "GpsModule.h"
 #include "config.h"
+#include <math.h>
 
 GpsModule::GpsModule()
     : _filtLat(0.0), _filtLon(0.0),
@@ -87,6 +88,23 @@ bool GpsModule::clearFaultIfFresh() {
     return true;
 }
 
+double GpsModule::filterAlpha() const {
+    float hdop = 99.0f;
+    if (_gps.hdop.isValid()) {
+        hdop = (float)const_cast<TinyGPSHDOP&>(_gps.hdop).hdop();
+    }
+    float speedKmh = 0.0f;
+    if (_gps.speed.isValid() &&
+        const_cast<TinyGPSSpeed&>(_gps.speed).age() < GPS_FRESH_FIX_MS) {
+        speedKmh = (float)const_cast<TinyGPSSpeed&>(_gps.speed).kmph();
+    }
+    // Moving with decent HDOP → track faster (less LOS lag). Poor HDOP stays smooth.
+    if (speedKmh >= GPS_FILTER_SPEED_KMH && hdop <= GPS_FILTER_HDOP_GOOD) {
+        return (double)GPS_FILTER_ALPHA_FAST;
+    }
+    return (double)GPS_FILTER_ALPHA;
+}
+
 void GpsModule::applyLowPassFilter(double lat, double lon) {
     if (!_filterInit) {
         _filtLat = lat;
@@ -94,13 +112,14 @@ void GpsModule::applyLowPassFilter(double lat, double lon) {
         _filterInit = true;
         return;
     }
-    _filtLat = GPS_FILTER_ALPHA * lat + (1.0 - GPS_FILTER_ALPHA) * _filtLat;
+    const double alpha = filterAlpha();
+    _filtLat = alpha * lat + (1.0 - alpha) * _filtLat;
 
     // Wrap longitude error across ±180° before blending.
     double dLon = lon - _filtLon;
     while (dLon > 180.0)  dLon -= 360.0;
     while (dLon < -180.0) dLon += 360.0;
-    _filtLon = _filtLon + GPS_FILTER_ALPHA * dLon;
+    _filtLon = _filtLon + alpha * dLon;
     while (_filtLon > 180.0)  _filtLon -= 360.0;
     while (_filtLon < -180.0) _filtLon += 360.0;
 }

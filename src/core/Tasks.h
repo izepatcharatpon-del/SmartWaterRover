@@ -53,6 +53,7 @@ struct SystemContext {
     MissionFsm*          fsm;
 
     QueueHandle_t     logQueue;
+    QueueHandle_t     stageQueue;
     SemaphoreHandle_t stateMutex;
 
     TelemetryPacket   snapshot;
@@ -60,6 +61,7 @@ struct SystemContext {
     float             batteryVoltage;
     uint32_t          logDropCount;
     uint32_t          ackDropCount;
+    uint32_t          stageDropCount;
 };
 
 void navigationTask(void* pv);

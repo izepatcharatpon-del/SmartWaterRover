@@ -44,6 +44,7 @@ private:
     bool          _faultLatched;
 
     void applyLowPassFilter(double lat, double lon);
+    double filterAlpha() const;
     void sendUbx(const uint8_t* msg, size_t len);
 };
 

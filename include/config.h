@@ -15,27 +15,39 @@
 #define ADS1115_I2C_ADDR       0x48
 // Magnetic declination (degrees, east positive). Approx. central Thailand.
 #define MAGNETIC_DECLINATION_DEG (-0.6f)
+// Hard-iron / ellipse scale (raw min/max from one field spin). Equal ±span
+// disables correction (identity). Replace after calibration.
+#define COMPASS_X_MIN          (-2048.0f)
+#define COMPASS_X_MAX          ( 2048.0f)
+#define COMPASS_Y_MIN          (-2048.0f)
+#define COMPASS_Y_MAX          ( 2048.0f)
 
 // ----------------------- UART2 (GPS NEO-8M) ----------------------------------
-#define GPS_RX_PIN             16
-#define GPS_TX_PIN             17
+// Bench wiring that works: ESP GPIO17=RX ← GPS TX, ESP GPIO16=TX → GPS RX
+#define GPS_RX_PIN             17
+#define GPS_TX_PIN             16
 #define GPS_BAUD               9600
 #define GPS_MAX_BYTES_PER_UPDATE 256
 
 // ----------------------- 1-Wire (DS18B20) ------------------------------------
-#define TEMP_SENSOR_PIN        38
+#define TEMP_SENSOR_PIN        18
 
 // ----------------------- SPI (Micro SD) --------------------------------------
-#define SD_CS_PIN              21
-#define SD_MOSI_PIN            36
-#define SD_SCK_PIN             35
-#define SD_MISO_PIN            37
+#define SD_MOSI_PIN            11
+#define SD_SCK_PIN             12
+#define SD_MISO_PIN            13
+#define SD_CS_PIN              14
 
 // ----------------------- Battery voltage ADC (AA118 5:1) ---------------------
 #define BATTERY_ADC_PIN        4
 #define BATTERY_DIVIDER_RATIO  5.0f
+#define BATTERY_VOLTAGE_EMA_ALPHA 0.15f
+// Under propulsion, pack sag is normal — require a lower pack voltage to RTH.
+#define VOLTAGE_RTH_LOADED     10.30f
+#define BATTERY_LOAD_PWM_THRESH 80
 
 // ----------------------- Motors (BTS7960 x2) ---------------------------------
+// R_EN + L_EN tied HIGH to 3V3 (or 5V) — not driven by GPIO
 #define LEFT_MOTOR_RPWM        5
 #define LEFT_MOTOR_LPWM        6
 #define RIGHT_MOTOR_RPWM       40
@@ -83,10 +95,33 @@
 // Must be << chord at r=SPIRAL_A_M (~1.03 m).
 #define SPIRAL_WAYPOINT_RADIUS_M 0.45f
 
+// ----------------------- Water probe calibration -----------------------------
+// 3-point pH buffers @ 25 °C (standard sachets)
+#define PH_BUF_401             4.01f
+#define PH_BUF_686             6.86f
+#define PH_BUF_918             9.18f
+// Bench 3-point voltages (ADS1115 A0, AA118/probe board)
+#define PH_CAL_V401            3.0095f
+#define PH_CAL_V686            2.5725f
+#define PH_CAL_V918            2.1836f
+#define PH_NEUTRAL_VOLTAGE_V   PH_CAL_V686  // fallback mid = measured 6.86
+#define PH_SLOPE_25C_V         0.05916f
+#define PH_SLOPE_SCALE         1.00f
+#define TURBIDITY_A            (-1120.4f) // NTU = a*V^2 + b*V + c
+#define TURBIDITY_B            (5742.3f)
+#define TURBIDITY_C            (-4353.8f)
+#define TURBIDITY_CLEAR_V      4.20f      // above → treat as 0 NTU
+#define TURBIDITY_FAULT_V      2.50f      // below → open-wire / invalid
+#define TURBIDITY_NTU_SCALE    1.00f
+#define TURBIDITY_NTU_OFFSET   0.00f
+
 // ----------------------- Anomaly / wastewater --------------------------------
 #define ANOMALY_CLEAR_HYST_NTU 10.0f
 #define ANOMALY_COOLDOWN_MS    45000UL
 #define ANOMALY_ROC_WINDOW_MS  2000UL   // ROC uses ≥2 s window (not per-ADS dt)
+#define ANOMALY_BASELINE_DELTA_NTU 12.0f
+#define ANOMALY_BASELINE_DWELL_MS  4000UL
+#define ANOMALY_DISTURBANCE_MS     3000UL  // suppress ROC-only after hard thrust
 #define TURBIDITY_WARNING_NTU  25.0f
 #define TURBIDITY_WASTEWATER_NTU 50.0f
 #define TURBIDITY_ROC_LIMIT    15.0f    // NTU/min over ANOMALY_ROC_WINDOW_MS
@@ -105,7 +140,10 @@
 // ----------------------- GPS loss tiers --------------------------------------
 #define GPS_MIN_SATS           6
 #define GPS_MAX_HDOP           2.0f
-#define GPS_FILTER_ALPHA       0.2f
+#define GPS_FILTER_ALPHA       0.2f     // calm / poor HDOP
+#define GPS_FILTER_ALPHA_FAST  0.55f    // moving + good HDOP (less lag)
+#define GPS_FILTER_SPEED_KMH   0.8f     // above → prefer FAST alpha
+#define GPS_FILTER_HDOP_GOOD   1.5f
 #define GPS_FRESH_FIX_MS       2000UL
 #define GPS_TIMEZONE_OFFSET_H  7
 #define GPS_LOSS_HOLD_MS       10000UL
@@ -115,9 +153,11 @@
 // ----------------------- ESP-NOW / logging / WDT -----------------------------
 #define ESPNOW_WIFI_CHANNEL    1
 #define TELEMETRY_INTERVAL_MS  1000
+#define RADIO_DIAG_MS          5000UL
 #define BATTERY_REPORT_MS      300000UL
 #define ESPNOW_TX_RETRIES      3
 #define ESPNOW_TX_TIMEOUT_MS   40
+#define STAGE_STATUS_QUEUE_LENGTH 8
 #define SD_INTEGRITY_MS        30000UL
 #define WATCHDOG_TIMEOUT_S     3
 

@@ -6,9 +6,9 @@
 #include <freertos/semphr.h>
 #include "Packets.h"
 
-// Appends telemetry rows to a CSV on the SD card. Guards the shared SPI bus
-// with a mutex and flushes at most once per second to bound data loss on power
-// cut. See project_vulnerabilities.md section 6.
+// Appends telemetry rows to a CSV on the SD card (SdFat — not Arduino SD.h).
+// Guards the shared SPI bus with a mutex and flushes at most once per second
+// to bound data loss on power cut. See project_vulnerabilities.md section 6.
 class DataLogger {
 public:
     DataLogger();
