@@ -20,6 +20,122 @@ static int chooseBasePwm(float headingErrorDeg, float distToEndM, int cruisePwm)
     return cruisePwm;
 }
 
+static void toggleRadioTxPause(SystemContext* ctx) {
+    static uint32_t lastMs = 0;
+    const uint32_t now = millis();
+    // One key or a pasted burst → one toggle.
+    if ((now - lastMs) < 250UL) {
+        return;
+    }
+    lastMs = now;
+    ctx->radioTxPaused = !ctx->radioTxPaused;
+    Serial.printf("[USV] radio TX %s (RX still on)\n",
+                  ctx->radioTxPaused ? "PAUSED" : "ON");
+}
+
+static void pollCalButton(SystemContext* ctx) {
+    static bool armed = false;
+    static bool lastRaw = true;
+    static bool stableReleased = true;
+    static uint32_t lastEdgeMs = 0;
+    const uint32_t now = millis();
+    if (!armed) {
+        if (now < COMPASS_CAL_BUTTON_ARM_MS) {
+            return;
+        }
+        armed = true;
+        lastRaw = (digitalRead(COMPASS_CAL_BUTTON_PIN) != LOW);
+        stableReleased = lastRaw;
+        lastEdgeMs = now;
+        return;
+    }
+
+    const bool released = (digitalRead(COMPASS_CAL_BUTTON_PIN) != LOW);
+    if (released != lastRaw) {
+        lastRaw = released;
+        lastEdgeMs = now;
+        return;
+    }
+    if ((now - lastEdgeMs) < COMPASS_CAL_BUTTON_DEBOUNCE_MS) {
+        return;
+    }
+    if (stableReleased == released) {
+        return;
+    }
+    stableReleased = released;
+    if (released) {
+        return;
+    }
+    if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        ctx->command.compassCalStart = true;
+        xSemaphoreGive(ctx->stateMutex);
+        Serial.println(F("[USV] CALMAG button (BOOT)"));
+    }
+}
+
+static void pollSerialCommands(SystemContext* ctx) {
+    static char line[24];
+    static uint8_t len = 0;
+    while (Serial.available() > 0) {
+        const int ch = Serial.read();
+        if (ch < 0) break;
+        if (ch == '\r' || ch == '\n') {
+            if (len == 0) continue;
+            line[len] = '\0';
+            len = 0;
+            char* s = line;
+            while (*s == ' ' || *s == '\t') s++;
+            char* e = s + strlen(s);
+            while (e > s && (e[-1] == ' ' || e[-1] == '\t')) {
+                *--e = '\0';
+            }
+            bool startCal = (strcasecmp(s, "CALMAG") == 0);
+            bool clearCal = (strcasecmp(s, "CALMAGCLR") == 0);
+            if (startCal) {
+                Serial.println(F("[USV] CALMAG received on Serial"));
+            } else if (clearCal) {
+                Serial.println(F("[USV] CALMAGCLR received on Serial"));
+            } else if (s[0] != '\0') {
+                toggleRadioTxPause(ctx);
+            }
+            if ((startCal || clearCal) &&
+                xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (startCal) ctx->command.compassCalStart = true;
+                if (clearCal) ctx->command.compassCalClear = true;
+                xSemaphoreGive(ctx->stateMutex);
+            }
+            continue;
+        }
+        if (ch < 32) {
+            continue;
+        }
+        // Any key except C/c (start of CALMAG) toggles TX immediately.
+        if (len == 0 && ch != 'C' && ch != 'c') {
+            toggleRadioTxPause(ctx);
+            continue;
+        }
+        if (len < (uint8_t)(sizeof(line) - 1)) {
+            line[len++] = (char)ch;
+        } else {
+            len = 0;
+        }
+    }
+}
+
+#if RADIO_TRACE
+static const char* radioCmdName(uint8_t code) {
+    switch (code) {
+        case CMD_NORMAL:              return "NORMAL";
+        case CMD_EMERGENCY_STOP:      return "ESTOP";
+        case CMD_FORCE_RTH:           return "RTH";
+        case CMD_START_ARM:           return "START_ARM";
+        case CMD_CLEAR_ESTOP:         return "CLEAR_ESTOP";
+        case CMD_MISSION_UPLOAD_DONE: return "UPLOAD_DONE";
+        default:                      return "?";
+    }
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Core 1 — navigation & control loop
 // ---------------------------------------------------------------------------
@@ -107,6 +223,19 @@ void navigationTask(void* pv) {
             WaypointACKPacket ack;
             ack.packet_index = wps.packet_index;
             ack.ack_status   = ok ? ACK_OK : ACK_NACK;
+#if RADIO_TRACE
+            Serial.printf("[RX] WP idx=%u count=%u ack=%s",
+                          (unsigned)wps.packet_index,
+                          (unsigned)wps.waypoint_count,
+                          ok ? "OK" : "NACK");
+            if (wps.waypoint_count > 0 && wps.waypoint_count <= 12) {
+                const uint8_t last = (uint8_t)(wps.waypoint_count - 1);
+                Serial.printf(" first=%.6f,%.6f last=%.6f,%.6f",
+                              wps.waypoints[0].lat, wps.waypoints[0].lon,
+                              wps.waypoints[last].lat, wps.waypoints[last].lon);
+            }
+            Serial.println();
+#endif
             if (EspNowLink::ackQueue) {
                 if (xQueueSend(EspNowLink::ackQueue, &ack,
                                pdMS_TO_TICKS(5)) != pdTRUE) {
@@ -128,10 +257,19 @@ void navigationTask(void* pv) {
             cmd = lastCmd;
         }
 
-        // Seal multi-batch upload when shore says the last full (12/12) batch is done.
-        if (cmd.sealMissionUpload) {
+        // Seal multi-batch upload when shore says the last full (12/12) batch
+        // is done, or when START_ARM arrives (Start implies the list is complete).
+        if (cmd.sealMissionUpload ||
+            (cmd.start && ctx->nav->hasWaypoints() &&
+             !ctx->nav->uploadComplete())) {
+            const bool sealedByStart = cmd.start && !cmd.sealMissionUpload;
             ctx->nav->sealMissionUpload();
-            if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            if (sealedByStart) {
+                Serial.printf("[USV] START_ARM sealed upload n=%d\n",
+                              ctx->nav->count());
+            }
+            if (cmd.sealMissionUpload &&
+                xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 ctx->command.sealMissionUpload = false;
                 xSemaphoreGive(ctx->stateMutex);
             }
@@ -151,6 +289,74 @@ void navigationTask(void* pv) {
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 ctx->command.forceRth = false;
                 xSemaphoreGive(ctx->stateMutex);
+            }
+        }
+
+        if (cmd.compassCalClear) {
+            if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                ctx->command.compassCalClear = false;
+                xSemaphoreGive(ctx->stateMutex);
+            }
+            const bool cleared = ctx->compass->clearStoredCalibration();
+            Serial.printf("[USV] CALMAGCLR %s — factory hard-iron\n",
+                          cleared ? "ok" : "FAIL");
+        }
+        if (cmd.compassCalStart) {
+            if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                ctx->command.compassCalStart = false;
+                xSemaphoreGive(ctx->stateMutex);
+            }
+            if (ctx->compass->isCalibrating()) {
+                float xMin = 0, xMax = 0, yMin = 0, yMax = 0;
+                uint16_t samples = 0;
+                uint32_t elapsedMs = 0;
+                ctx->compass->getCalProgress(xMin, xMax, yMin, yMax, samples, elapsedMs);
+                if (ctx->compass->finishCalibration()) {
+                    ctx->compass->getHardIron(xMin, xMax, yMin, yMax);
+                    Serial.printf(
+                        "[USV] CALMAG saved NVS x=[%.0f,%.0f] y=[%.0f,%.0f] n=%u\n",
+                        xMin, xMax, yMin, yMax, (unsigned)samples);
+                } else {
+                    Serial.printf(
+                        "[USV] CALMAG not ready x=[%.0f,%.0f] y=[%.0f,%.0f] n=%u "
+                        "(keep spinning; press BOOT again to save)\n",
+                        xMin, xMax, yMin, yMax, (unsigned)samples);
+                }
+            } else if (ctx->fsm->state() == STATE_STANDBY &&
+                       ctx->compass->i2cAddress() != 0 &&
+                       ctx->compass->startCalibration()) {
+                Serial.println(F("[USV] CALMAG started — keep level, two slow yaw turns. "
+                                 "Pause to untangle USB is OK. Press BOOT to save, "
+                                 "CALMAGCLR to abort"));
+            } else {
+                Serial.println(F("[USV] CALMAG refused — need STANDBY and compass OK"));
+            }
+        }
+        if (ctx->compass->isCalibrating()) {
+            if (ctx->fsm->state() != STATE_STANDBY) {
+                ctx->compass->abortCalibration();
+                Serial.println(F("[USV] CALMAG abort — left STANDBY"));
+            } else {
+                static uint8_t calProgDiv = 0;
+                if (++calProgDiv >= (uint8_t)(1000 / NAV_LOOP_PERIOD_MS)) {
+                    calProgDiv = 0;
+                    float xMin = 0, xMax = 0, yMin = 0, yMax = 0;
+                    uint16_t samples = 0;
+                    uint32_t elapsedMs = 0;
+                    ctx->compass->getCalProgress(
+                        xMin, xMax, yMin, yMax, samples, elapsedMs);
+                    const float dx = xMax - xMin;
+                    const float dy = yMax - yMin;
+                    Serial.printf(
+                        "[USV] CALMAG %s x=[%.0f,%.0f] dx=%.0f y=[%.0f,%.0f] dy=%.0f "
+                        "need=%.0f n=%u t=%lus\n",
+                        ctx->compass->calibrationReady() ? "READY press BOOT"
+                                                         : "spin",
+                        xMin, xMax, dx, yMin, yMax, dy,
+                        (double)COMPASS_CAL_MIN_SPAN,
+                        (unsigned)samples,
+                        (unsigned long)(elapsedMs / 1000UL));
+                }
             }
         }
 
@@ -471,6 +677,13 @@ void navigationTask(void* pv) {
             ctx->snapshot.battery_percent = ctx->battery->getBatteryPercent();
             ctx->snapshot.heading_angle   = compassOk ? heading : NAN;
             ctx->batteryVoltage            = battV;
+            ctx->compassAddr               = ctx->compass->i2cAddress();
+            ctx->compassFailCount          = ctx->compass->failCount();
+            ctx->compassFresh              = ctx->compass->isFresh() ? 1 : 0;
+            ctx->compassRawX               = ctx->compass->rawX();
+            ctx->compassRawY               = ctx->compass->rawY();
+            ctx->compassNvs                = ctx->compass->nvsLoaded() ? 1 : 0;
+            ctx->compassCalRun             = ctx->compass->isCalibrating() ? 1 : 0;
             logRec = ctx->snapshot;
             // SD records have their own monotonic 20 Hz sequence. ESP-NOW
             // sequence remains owned exclusively by ioTask.
@@ -503,6 +716,9 @@ void ioTask(void* pv) {
     unsigned long lastRadioDiag = 0;
 
     for (;;) {
+        pollCalButton(ctx);
+        pollSerialCommands(ctx);
+
         // ---- Drain inbound command queue ----
         CommandPacket cmdPkt;
         while (EspNowLink::commandQueue) {
@@ -566,16 +782,38 @@ void ioTask(void* pv) {
                     break;
                 default:
                     xSemaphoreGive(ctx->stateMutex);
+#if RADIO_TRACE
+                    Serial.printf("[RX] CMD ?(%u) steer=%d speed=%d (ignored)\n",
+                                  (unsigned)cmdPkt.sys_command,
+                                  (int)cmdPkt.manual_steer,
+                                  (int)cmdPkt.manual_speed);
+#endif
                     continue;
             }
             xSemaphoreGive(ctx->stateMutex);
+#if RADIO_TRACE
+            Serial.printf("[RX] CMD %s(%u) steer=%d speed=%d\n",
+                          radioCmdName(cmdPkt.sys_command),
+                          (unsigned)cmdPkt.sys_command,
+                          (int)cmdPkt.manual_steer,
+                          (int)cmdPkt.manual_speed);
+#endif
         }
 
         // ---- Drain ACK queue from nav -> shore ----
         WaypointACKPacket ack;
         while (EspNowLink::ackQueue &&
                xQueueReceive(EspNowLink::ackQueue, &ack, 0) == pdTRUE) {
-            ctx->link->sendAck(ack);
+            const bool ok = ctx->link->sendAck(ack);
+#if RADIO_TRACE
+            Serial.printf("[TX] ACK %s idx=%u status=%u %s\n",
+                          ok ? "ok" : "FAIL",
+                          (unsigned)ack.packet_index,
+                          (unsigned)ack.ack_status,
+                          EspNowLink::describeLastTx());
+#else
+            (void)ok;
+#endif
         }
 
         // ---- Drain stage/intent events from nav -> shore ----
@@ -584,17 +822,46 @@ void ioTask(void* pv) {
                xQueueReceive(ctx->stageQueue, &stageStatus, 0) == pdTRUE) {
             if (!ctx->link->sendStageStatus(stageStatus)) {
                 ctx->stageDropCount++;
+#if RADIO_TRACE
+                Serial.printf(
+                    "[TX] STAGE FAIL seq=%lu stage=%u intent=%u next=%u reason=%u %s\n",
+                    (unsigned long)stageStatus.sequence_number,
+                    (unsigned)stageStatus.current_stage,
+                    (unsigned)stageStatus.intent,
+                    (unsigned)stageStatus.next_stage,
+                    (unsigned)stageStatus.reason,
+                    EspNowLink::describeLastTx());
+#endif
             }
+#if RADIO_TRACE
+            else {
+                Serial.printf(
+                    "[TX] STAGE ok seq=%lu stage=%u intent=%u next=%u reason=%u "
+                    "flags=0x%02X wp=%u/%u batch=%u %s\n",
+                    (unsigned long)stageStatus.sequence_number,
+                    (unsigned)stageStatus.current_stage,
+                    (unsigned)stageStatus.intent,
+                    (unsigned)stageStatus.next_stage,
+                    (unsigned)stageStatus.reason,
+                    (unsigned)stageStatus.flags,
+                    (unsigned)stageStatus.waypoint_index,
+                    (unsigned)stageStatus.waypoint_count,
+                    (unsigned)stageStatus.expected_batch_index,
+                    EspNowLink::describeLastTx());
+            }
+#endif
         }
 
         // ---- Periodic telemetry TX (1 Hz even if a send fails — do not spin) ----
-        if (millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
+        if (!ctx->radioTxPaused &&
+            millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
             lastTelemetry = millis();
             TelemetryPacket tp;
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 tp = ctx->snapshot;
                 xSemaphoreGive(ctx->stateMutex);
-                if (ctx->link->sendTelemetry(tp)) {
+                const bool ok = ctx->link->sendTelemetry(tp);
+                if (ok) {
                     // Mirror stamped seq back into telemetry snapshot only.
                     if (xSemaphoreTake(ctx->stateMutex,
                                        pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -602,11 +869,27 @@ void ioTask(void* pv) {
                         xSemaphoreGive(ctx->stateMutex);
                     }
                 }
+#if RADIO_TRACE
+                Serial.printf(
+                    "[TX] TEL %s seq=%lu lat=%.6f lon=%.6f ph=%.2f ntu=%.1f "
+                    "t=%.1f mode=%u batt=%u hdg=%.1f %s\n",
+                    ok ? "ok" : "FAIL",
+                    (unsigned long)tp.sequence_number,
+                    tp.gps_lat, tp.gps_lon,
+                    tp.water_ph, tp.water_turbidity, tp.water_temp,
+                    (unsigned)tp.current_mode,
+                    (unsigned)tp.battery_percent,
+                    tp.heading_angle,
+                    EspNowLink::describeLastTx());
+#endif
             }
         }
 
-        // ---- Optional battery report ----
-        if (millis() - lastBattReport >= BATTERY_REPORT_MS) {
+        // ---- Optional battery report (same cadence as TELEMETRY: do not spin) ----
+        // Advancing only on TX success flooded ESP-NOW + Serial when the peer
+        // was down (~20 ms retries after the first 5 min window).
+        if (!ctx->radioTxPaused &&
+            millis() - lastBattReport >= BATTERY_REPORT_MS) {
             BatteryReportPacket br;
             br.report_timestamp = millis();
             br.current_draw_ma  = 0.0f;  // no ACS712
@@ -618,8 +901,17 @@ void ioTask(void* pv) {
                 haveBattery = true;
                 xSemaphoreGive(ctx->stateMutex);
             }
-            if (haveBattery && ctx->link->sendBatteryReport(br)) {
+            if (haveBattery) {
                 lastBattReport = millis();
+                const bool ok = ctx->link->sendBatteryReport(br);
+#if RADIO_TRACE
+                Serial.printf("[TX] BATT %s V=%.2f soc=%.0f %s\n",
+                              ok ? "ok" : "FAIL",
+                              br.battery_voltage, br.state_of_charge,
+                              EspNowLink::describeLastTx());
+#else
+                (void)ok;
+#endif
             }
         }
 
@@ -644,14 +936,46 @@ void ioTask(void* pv) {
 
         if (millis() - lastRadioDiag >= RADIO_DIAG_MS) {
             lastRadioDiag = millis();
+            const uint8_t* peer = EspNowLink::peerMac();
             Serial.printf(
-                "[USV] radio rxDrop=%lu isrDrop=%lu txFail=%lu ackDrop=%lu stageDrop=%lu logDrop=%lu\n",
+                "[USV] radio tx=%s rxDrop=%lu (mac=%lu len=%lu cmd=%lu) rxOk=%lu "
+                "isrDrop=%lu txFail=%lu ackDrop=%lu stageDrop=%lu logDrop=%lu %s "
+                "peer=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                ctx->radioTxPaused ? "PAUSE" : "ON",
                 (unsigned long)EspNowLink::droppedPackets,
+                (unsigned long)EspNowLink::dropMac,
+                (unsigned long)EspNowLink::dropLen,
+                (unsigned long)EspNowLink::dropCmd,
+                (unsigned long)EspNowLink::rxAcceptCount,
                 (unsigned long)EspNowLink::droppedIsrPackets,
                 (unsigned long)EspNowLink::txFailCount,
                 (unsigned long)ctx->ackDropCount,
                 (unsigned long)ctx->stageDropCount,
-                (unsigned long)ctx->logDropCount);
+                (unsigned long)ctx->logDropCount,
+                EspNowLink::describeLastTx(),
+                peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
+            if (EspNowLink::lastTx.result != EspNowLink::TX_RESULT_OK) {
+                Serial.printf("[USV] radio hint: %s\n", EspNowLink::pairingHint());
+            }
+            uint8_t cAddr = 0, cFail = 0, cFresh = 0, cNvs = 0, cCal = 0;
+            int16_t cX = 0, cY = 0;
+            float hdg = NAN;
+            if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                cAddr  = ctx->compassAddr;
+                cFail  = ctx->compassFailCount;
+                cFresh = ctx->compassFresh;
+                cX     = ctx->compassRawX;
+                cY     = ctx->compassRawY;
+                cNvs   = ctx->compassNvs;
+                cCal   = ctx->compassCalRun;
+                hdg    = ctx->snapshot.heading_angle;
+                xSemaphoreGive(ctx->stateMutex);
+            }
+            Serial.printf(
+                "[USV] compass addr=0x%02X fresh=%u fail=%u raw=%d,%d hdg=%.1f cal=%s\n",
+                (unsigned)cAddr, (unsigned)cFresh, (unsigned)cFail,
+                (int)cX, (int)cY, hdg,
+                cCal ? "RUN" : (cNvs ? "NVS" : "FACT"));
         }
 
         ctx->wdt->feed();

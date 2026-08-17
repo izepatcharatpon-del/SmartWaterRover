@@ -24,8 +24,24 @@ static MissionFsm          fsm;
 static SystemContext ctx;
 
 // TODO: replace with the shore/gateway board's real MAC.
-static uint8_t GATEWAY_MAC[6] = {0x24, 0x6F, 0x28, 0x00, 0x00, 0x01};
+static uint8_t GATEWAY_MAC[6] = {0x88, 0x57, 0x21, 0xAD, 0xAE, 0x8C};
 static const uint8_t DUMMY_GATEWAY_MAC[6] = {0x24, 0x6F, 0x28, 0x00, 0x00, 0x01};
+
+static void printI2cScan() {
+    Serial.print(F("[USV] I2C scan:"));
+    uint8_t found = 0;
+    for (uint8_t a = 1; a < 127; a++) {
+        Wire.beginTransmission(a);
+        if (Wire.endTransmission() == 0) {
+            Serial.printf(" 0x%02X", a);
+            found++;
+        }
+    }
+    if (found == 0) {
+        Serial.print(F(" (none)"));
+    }
+    Serial.println();
+}
 
 static void printMac(const char* label, const uint8_t mac[6]) {
     Serial.printf("[USV] %s %02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -43,9 +59,15 @@ static void printPairingBanner(bool commsOk) {
     Serial.printf("[USV] ESP-NOW ch=%u LR+encrypt %s\n",
                   (unsigned)ESPNOW_WIFI_CHANNEL,
                   commsOk ? "init OK" : "INIT FAIL");
+    Serial.println(F("[USV] keys PMK=USV_PMK_16bytes! LMK=USV_LMK_16bytes! encrypt=1 LR=1 PS=NONE"));
     Serial.println(F("[USV] gateway must match: Packets.h sizes 5/194/38/2/20/12"));
     Serial.println(F("[USV] CMD 0=NORMAL 1=ESTOP 2=RTH 3=START_ARM 4=CLEAR_ESTOP 5=UPLOAD_DONE"));
     Serial.println(F("[USV] indoor: no GPS => STANDBY + motors stopped. Pass = telemetry ~1 Hz"));
+    Serial.println(F("[USV] BOOT (not RST) in STANDBY = CALMAG; press again to save"));
+    Serial.println(F("[USV] click this monitor, press any key to pause/resume TEL (not C = CALMAG)"));
+#if RADIO_TRACE
+    Serial.println(F("[USV] radio trace [TX]/[RX] on this Serial — compare with gateway"));
+#endif
 }
 
 static void haltFatal(const char* msg) {
@@ -60,6 +82,7 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     Serial.println(F("[USV] boot"));
+    pinMode(COMPASS_CAL_BUTTON_PIN, INPUT_PULLUP);
 
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setTimeOut(I2C_TIMEOUT_MS);
@@ -79,8 +102,15 @@ void setup() {
     battery.begin();
     if (compass.begin()) {
         Serial.printf("[USV] compass OK (QMC5883P @ 0x%02X)\n", compass.i2cAddress());
+        float xMin = 0, xMax = 0, yMin = 0, yMax = 0;
+        compass.getHardIron(xMin, xMax, yMin, yMax);
+        Serial.printf("[USV] compass hard-iron %s x=[%.0f,%.0f] y=[%.0f,%.0f]\n",
+                      compass.nvsLoaded() ? "NVS" : "factory",
+                      xMin, xMax, yMin, yMax);
     } else {
         Serial.println(F("[USV] compass FAIL — need QMC5883P@0x2C chipID 0x80"));
+        printI2cScan();
+        Serial.println(F("[USV] if scan shows 0x0D it is QMC5883L not P; 0x48 only = ADS, compass not on bus"));
     }
     compass.setDeclination(MAGNETIC_DECLINATION_DEG);
     gps.begin();

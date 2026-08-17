@@ -27,6 +27,34 @@ public:
     static uint32_t droppedPackets;
     static uint32_t droppedIsrPackets;
     static uint32_t txFailCount;
+    static uint32_t rxAcceptCount;
+    static uint32_t dropMac;
+    static uint32_t dropLen;
+    static uint32_t dropCmd;
+
+    enum TxResult : uint8_t {
+        TX_RESULT_OK = 0,
+        TX_RESULT_SEND_ERR,  // esp_now_send() rejected the call
+        TX_RESULT_NO_ACK,    // callback: peer did not ACK
+        TX_RESULT_TIMEOUT    // no send callback within ESPNOW_TX_TIMEOUT_MS
+    };
+
+    struct TxDiag {
+        TxResult  result;
+        esp_err_t sendErr;
+        uint8_t   attemptsUsed;
+        uint8_t   noAckCount;
+        uint8_t   sendErrCount;
+        uint8_t   timeoutCount;
+        uint8_t   wifiChannel;
+        uint8_t   peerExist;
+    };
+
+    static TxDiag lastTx;
+    static const uint8_t* peerMac();
+    // ioTask only — each uses its own static buffer, not reentrant.
+    static const char* describeLastTx();
+    static const char* pairingHint();
 
     // Dedicated latched safety path: an E-Stop cannot be lost when commandQueue is full.
     static bool emergencyPending();

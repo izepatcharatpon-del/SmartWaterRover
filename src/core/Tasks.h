@@ -34,6 +34,8 @@ struct CommandState {
     int      manualSteer;
     int      manualSpeed;
     uint32_t lastManualMs;
+    bool     compassCalStart;
+    bool     compassCalClear;
 };
 
 struct SystemContext {
@@ -59,9 +61,17 @@ struct SystemContext {
     TelemetryPacket   snapshot;
     CommandState      command;
     float             batteryVoltage;
+    uint8_t           compassAddr;
+    uint8_t           compassFailCount;
+    uint8_t           compassFresh;
+    int16_t           compassRawX;
+    int16_t           compassRawY;
+    uint8_t           compassNvs;
+    uint8_t           compassCalRun;
     uint32_t          logDropCount;
     uint32_t          ackDropCount;
     uint32_t          stageDropCount;
+    bool              radioTxPaused;
 };
 
 void navigationTask(void* pv);

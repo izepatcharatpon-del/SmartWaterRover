@@ -50,10 +50,11 @@ bool DataLogger::begin() {
     static const uint32_t kHzList[] = { 400000UL, 1000000UL, 100000UL, 4000000UL };
     for (uint8_t i = 0; i < 4 && !mounted; i++) {
         g_sd.end();
-        if (!g_sd.cardBegin(SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, kHzList[i], &g_spi))) {
-            if (!g_sd.cardBegin(SdSpiConfig(SD_CS_PIN, SHARED_SPI, kHzList[i], &g_spi))) {
-                continue;
-            }
+        // SHARED_SPI only: DEDICATED_SPI beginTransaction() in setup()
+        // (loopTask) and endTransaction() later in ioTask trips FreeRTOS
+        // "mutex given by non-owner" and reboots.
+        if (!g_sd.cardBegin(SdSpiConfig(SD_CS_PIN, SHARED_SPI, kHzList[i], &g_spi))) {
+            continue;
         }
         if (g_sd.volumeBegin()) {
             mounted = true;
@@ -69,6 +70,8 @@ bool DataLogger::begin() {
     snprintf(_filename, sizeof(_filename), "/m_%lu.csv",
              (unsigned long)millis());
     openAndWriteHeader();
+    // Drop a leftover Arduino SPI lock on this task before ioTask writes.
+    g_spi.endTransaction();
     _ready = (bool)g_logFile;
     _lastFlush = millis();
     _writeFailCount = 0;

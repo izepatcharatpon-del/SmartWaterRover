@@ -52,8 +52,9 @@ public:
     bool     uploadComplete() const { return _missionUploadComplete; }
     uint8_t  expectedPacketIndex() const { return _expectedPacketIndex; }
 
-    // Idempotent multi-batch upload. Mid-mission (!allowNewMission) rejects
-    // all new batches; identical last-packet retries still ACK.
+    // Idempotent multi-batch upload. STANDBY retries of the last packet ACK.
+    // Mid-mission / E-Stop (!allowNewMission) NACK every batch, including
+    // an identical last-packet retry.
     bool     acceptBatch(const WaypointArrayPacket& pkt, bool allowNewMission);
 
     void     sealMissionUpload();

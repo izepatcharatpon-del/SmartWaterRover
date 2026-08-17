@@ -125,7 +125,7 @@ enum CommandCode {
     CMD_NORMAL              = 0,  // idle / clear force-RTH latch (does NOT clear E-Stop)
     CMD_EMERGENCY_STOP      = 1,  // latch E-Stop immediately
     CMD_FORCE_RTH           = 2,  // force return-to-home
-    CMD_START_ARM           = 3,  // arm mission start (requires waypoints + GPS)
+    CMD_START_ARM           = 3,  // seal pending upload if any, then arm (needs GPS+compass)
     CMD_CLEAR_ESTOP         = 4,  // explicit clear of latched E-Stop -> STANDBY
     // Seal multi-batch waypoint upload when the last batch is full (count==12).
     // Batches with waypoint_count < 12 auto-seal. Wire size unchanged.

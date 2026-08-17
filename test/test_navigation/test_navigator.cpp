@@ -100,16 +100,16 @@ void test_accept_batch_idempotent_and_order(void) {
     Navigator nav;
     TEST_ASSERT_TRUE(nav.acceptBatch(p0, true));
     TEST_ASSERT_EQUAL(1, nav.count());
-    // Lost ACK -> identical batch 0 retry must not reset/reload the mission.
-    TEST_ASSERT_TRUE(nav.acceptBatch(p0, false));
+    // Lost ACK in STANDBY -> identical retry ACKs and must not reset the list.
+    TEST_ASSERT_TRUE(nav.acceptBatch(p0, true));
     TEST_ASSERT_EQUAL(1, nav.count());
-    // Multi-batch upload happens in STANDBY (allowNewMission=true).
     TEST_ASSERT_TRUE(nav.acceptBatch(p1, true));
     TEST_ASSERT_EQUAL(2, nav.count());
-    // Duplicate of last -> OK, no append
-    TEST_ASSERT_TRUE(nav.acceptBatch(p1dup, false));
+    TEST_ASSERT_TRUE(nav.acceptBatch(p1dup, true));
     TEST_ASSERT_EQUAL(2, nav.count());
-    // Skip index 2 -> NACK
+    // GRID / E-Stop: even the last accepted packet NACK.
+    TEST_ASSERT_FALSE(nav.acceptBatch(p1dup, false));
+    TEST_ASSERT_EQUAL(2, nav.count());
     TEST_ASSERT_FALSE(nav.acceptBatch(p2skip, true));
     TEST_ASSERT_EQUAL(2, nav.count());
 }
@@ -143,11 +143,43 @@ void test_changed_batch_zero_rejected_mid_mission(void) {
     TEST_ASSERT_TRUE(nav.acceptBatch(p0, true));
     nav.setMissionOrigin(13.74, 100.49);
     nav.advanceWaypoint();
-    TEST_ASSERT_TRUE(nav.acceptBatch(p0, false));
+    TEST_ASSERT_FALSE(nav.acceptBatch(p0, false));
     TEST_ASSERT_EQUAL(1, nav.index());
     TEST_ASSERT_FALSE(nav.acceptBatch(changed, false));
     TEST_ASSERT_EQUAL(1, nav.count());
     TEST_ASSERT_EQUAL(1, nav.index());
+}
+
+void test_estop_resend_of_old_last_batch_nacks(void) {
+    // HIL 17 Aug: after E-Stop, shore re-sent idx 0/1 (NACK) and idx 2 matching
+    // the previous mission's last batch (was ACK). All three must NACK.
+    WaypointArrayPacket p0, p1, p2;
+    memset(&p0, 0, sizeof(p0));
+    memset(&p1, 0, sizeof(p1));
+    memset(&p2, 0, sizeof(p2));
+    p0.packet_index = 0;
+    p0.waypoint_count = 12;
+    p1.packet_index = 1;
+    p1.waypoint_count = 12;
+    for (int i = 0; i < 12; i++) {
+        p0.waypoints[i] = {20.049868 + i * 0.0001, 99.885139};
+        p1.waypoints[i] = {20.050867 + i * 0.0001, 99.885139};
+    }
+    p2.packet_index = 2;
+    p2.waypoint_count = 2;
+    p2.waypoints[0] = {20.051867, 99.885139};
+    p2.waypoints[1] = {20.051867, 99.887115};
+
+    Navigator nav;
+    TEST_ASSERT_TRUE(nav.acceptBatch(p0, true));
+    TEST_ASSERT_TRUE(nav.acceptBatch(p1, true));
+    TEST_ASSERT_TRUE(nav.acceptBatch(p2, true));
+    TEST_ASSERT_EQUAL(26, nav.count());
+
+    TEST_ASSERT_FALSE(nav.acceptBatch(p0, false));
+    TEST_ASSERT_FALSE(nav.acceptBatch(p1, false));
+    TEST_ASSERT_FALSE(nav.acceptBatch(p2, false));
+    TEST_ASSERT_EQUAL(26, nav.count());
 }
 
 void test_same_one_batch_mission_can_restart_in_standby(void) {
@@ -629,6 +661,7 @@ int main(int, char**) {
     RUN_TEST(test_accept_batch_idempotent_and_order);
     RUN_TEST(test_mid_mission_append_rejected);
     RUN_TEST(test_changed_batch_zero_rejected_mid_mission);
+    RUN_TEST(test_estop_resend_of_old_last_batch_nacks);
     RUN_TEST(test_same_one_batch_mission_can_restart_in_standby);
     RUN_TEST(test_invalid_append_is_transactional);
     RUN_TEST(test_reject_nan_batch);

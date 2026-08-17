@@ -15,12 +15,20 @@
 #define ADS1115_I2C_ADDR       0x48
 // Magnetic declination (degrees, east positive). Approx. central Thailand.
 #define MAGNETIC_DECLINATION_DEG (-0.6f)
-// Hard-iron / ellipse scale (raw min/max from one field spin). Equal ±span
-// disables correction (identity). Replace after calibration.
+// Hard-iron factory fallback (raw min/max). Equal ±span is identity-ish.
+// Runtime spin cal (Serial CALMAG) overrides these via NVS namespace usv_mag.
 #define COMPASS_X_MIN          (-2048.0f)
 #define COMPASS_X_MAX          ( 2048.0f)
 #define COMPASS_Y_MIN          (-2048.0f)
 #define COMPASS_Y_MAX          ( 2048.0f)
+// User finishes with BOOT / Serial CALMAG. No auto-save — USB may tangle mid-spin.
+// Bench XY diameter is ~750 LSB (not 8 G ~3600). 600 rejects a wiggle (~400) but allows a yaw circle.
+#define COMPASS_CAL_MIN_SPAN   600.0f
+#define COMPASS_CAL_MIN_SAMPLES 40
+// DevKit BOOT (GPIO0, active LOW). Ignore RST — that reboots.
+#define COMPASS_CAL_BUTTON_PIN         0
+#define COMPASS_CAL_BUTTON_DEBOUNCE_MS 50
+#define COMPASS_CAL_BUTTON_ARM_MS      3000UL
 
 // ----------------------- UART2 (GPS NEO-8M) ----------------------------------
 // Bench wiring that works: ESP GPIO17=RX ← GPS TX, ESP GPIO16=TX → GPS RX
@@ -39,6 +47,8 @@
 #define SD_CS_PIN              14
 
 // ----------------------- Battery voltage ADC (AA118 5:1) ---------------------
+// One LiPo 3S pack feeds motors and the board (buck/BEC). USB is programming
+// only. Thrust sag can brownout the ESP32 — keep loaded-RTH / CRITICAL.
 #define BATTERY_ADC_PIN        4
 #define BATTERY_DIVIDER_RATIO  5.0f
 #define BATTERY_VOLTAGE_EMA_ALPHA 0.15f
@@ -129,7 +139,7 @@
 #define PH_HIGH_LIMIT_DAY      9.2f
 #define PH_HIGH_LIMIT_NIGHT    8.8f
 
-// ----------------------- Battery (LiPo 3S) -----------------------------------
+// ----------------------- Battery (single LiPo 3S pack) -----------------------
 #define VOLTAGE_FULL           12.6f
 #define VOLTAGE_RTH            10.5f
 #define VOLTAGE_CRITICAL       10.0f
@@ -151,8 +161,11 @@
 #define GPS_LOSS_FAULT_MS      120000UL
 
 // ----------------------- ESP-NOW / logging / WDT -----------------------------
-#define ESPNOW_WIFI_CHANNEL    1
+#define ESPNOW_WIFI_CHANNEL    9
 #define TELEMETRY_INTERVAL_MS  1000
+// 1 = dump ESP-NOW TX/RX fields on Serial (same COM as [USV]). Pairing bench
+// only; ioTask prints TEL/ACK/STAGE/BATT + RX CMD. Nav prints RX WP batches.
+#define RADIO_TRACE            1
 #define RADIO_DIAG_MS          5000UL
 #define BATTERY_REPORT_MS      300000UL
 #define ESPNOW_TX_RETRIES      3

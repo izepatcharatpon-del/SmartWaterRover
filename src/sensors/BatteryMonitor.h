@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 
-// Propulsion LiPo 3S voltage monitor (AA118). No current sensor on this build.
+// Single LiPo 3S pack (motors + board) via AA118. No current sensor on this build.
 class BatteryMonitor {
 public:
     BatteryMonitor();

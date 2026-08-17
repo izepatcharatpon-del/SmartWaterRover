@@ -150,11 +150,14 @@ bool Navigator::validateBatch(const WaypointArrayPacket& pkt, int availableSlots
 bool Navigator::acceptBatch(const WaypointArrayPacket& pkt, bool allowNewMission) {
     const uint32_t hash = packetHash(pkt);
 
-    // Duplicate of the last accepted packet -> idempotent ACK, including batch 0.
+    // Duplicate of the last accepted packet: ACK only in STANDBY. Outside
+    // STANDBY a retry of the old last batch must NACK so shore does not treat
+    // a rejected re-upload (new idx 0/1, coincidental idx 2) as success.
     if (_haveAcceptedPacket &&
         pkt.packet_index == _lastAcceptedPacketIndex &&
         hash == _lastAcceptedPacketHash) {
-        if (pkt.packet_index == 0 && allowNewMission && _index > 0) {
+        if (!allowNewMission) return false;
+        if (pkt.packet_index == 0 && _index > 0) {
             if (!loadWaypoints(pkt)) return false;
             _lastAcceptedPacketIndex = 0;
             _lastAcceptedPacketHash = hash;
@@ -165,8 +168,7 @@ bool Navigator::acceptBatch(const WaypointArrayPacket& pkt, bool allowNewMission
         return true;
     }
 
-    // Mid-mission: reject ALL new batches (not only batch 0). Prevents shore
-    // from extending a sealed route while GRID/SPIRAL/RTH is active.
+    // Mid-mission / E-Stop: reject ALL batches, including non-duplicates.
     if (!allowNewMission) return false;
 
     if (pkt.packet_index == 0) {

@@ -42,7 +42,8 @@ float BatteryMonitor::readVoltage() {
             _emaInit = true;
             if (!_outOfRangeLogged) {
                 Serial.println(F("[USV] battery ADC out of range x10 — latching CRITICAL"));
-                Serial.println(F("[USV] connect the 3S pack; mode=4 here is NOT a radio failure"));
+                Serial.println(F("[USV] connect the 3S pack; USB is programming only"));
+                Serial.println(F("[USV] mode=4 here is NOT a radio failure"));
                 _outOfRangeLogged = true;
             }
         }
