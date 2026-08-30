@@ -4,7 +4,6 @@
 #include <SdFat.h>
 #include <stdio.h>
 
-// SdFat — Arduino SD.h fails ACMD41 on this ESP32-S3 + module combo (bench).
 static SdFat   g_sd;
 static FsFile  g_logFile;
 static SPIClass g_spi(HSPI);
@@ -40,7 +39,6 @@ bool DataLogger::begin() {
     g_spi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     delay(200);
 
-    // ≥80 idle clocks with CS high before first CMD (helps ACMD41).
     g_spi.beginTransaction(SPISettings(100000, MSBFIRST, SPI_MODE0));
     for (int i = 0; i < 16; i++) g_spi.transfer(0xFF);
     g_spi.endTransaction();
@@ -50,9 +48,7 @@ bool DataLogger::begin() {
     static const uint32_t kHzList[] = { 400000UL, 1000000UL, 100000UL, 4000000UL };
     for (uint8_t i = 0; i < 4 && !mounted; i++) {
         g_sd.end();
-        // SHARED_SPI only: DEDICATED_SPI beginTransaction() in setup()
-        // (loopTask) and endTransaction() later in ioTask trips FreeRTOS
-        // "mutex given by non-owner" and reboots.
+        // DEDICATED_SPI panics if begin/endTransaction are on different tasks.
         if (!g_sd.cardBegin(SdSpiConfig(SD_CS_PIN, SHARED_SPI, kHzList[i], &g_spi))) {
             continue;
         }
@@ -66,11 +62,9 @@ bool DataLogger::begin() {
         return false;
     }
 
-    // One CSV per boot so missions do not silently append forever into one file.
     snprintf(_filename, sizeof(_filename), "/m_%lu.csv",
              (unsigned long)millis());
     openAndWriteHeader();
-    // Drop a leftover Arduino SPI lock on this task before ioTask writes.
     g_spi.endTransaction();
     _ready = (bool)g_logFile;
     _lastFlush = millis();

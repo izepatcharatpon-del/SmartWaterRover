@@ -4,20 +4,16 @@
 #include <math.h>
 #include <string.h>
 
-// Home position — captured on every STANDBY -> GRID_PATROL with valid GPS.
 static double g_homeLat = 0.0, g_homeLon = 0.0;
 static bool   g_homeSet = false;
-static bool   g_homeLeft = false;  // GPS dist >= RTH_DEPART (log only)
+static bool   g_homeLeft = false;
 static float    g_rthEntryDistM = NAN;
 static uint32_t g_rthEnterMs = 0;
 
-// Spiral chase target.
 static Waypoint g_spiralTgt = {0.0, 0.0};
 static bool     g_haveSpiralTgt = false;
 static bool     g_spiralInitialized = false;
 
-// Shore gets GPS/heading/mode/batt in every 1 Hz heartbeat. Water quality
-// rides the same 38 B packet but only while a mission is actually running.
 static bool radioSendsWaterQuality(uint8_t mode) {
     return mode == STATE_GRID_PATROL ||
            mode == STATE_SPIRAL_MAPPING ||
@@ -34,7 +30,6 @@ static int chooseBasePwm(float headingErrorDeg, float distToEndM, int cruisePwm)
 static void toggleRadioTxPause(SystemContext* ctx) {
     static uint32_t lastMs = 0;
     const uint32_t now = millis();
-    // One key or a pasted burst → one toggle.
     if ((now - lastMs) < 250UL) {
         return;
     }
@@ -120,7 +115,6 @@ static void pollSerialCommands(SystemContext* ctx) {
         if (ch < 32) {
             continue;
         }
-        // Any key except C/c (start of CALMAG) toggles TX immediately.
         if (len == 0 && ch != 'C' && ch != 'c') {
             toggleRadioTxPause(ctx);
             continue;
@@ -149,9 +143,6 @@ static const char* radioCmdName(uint8_t code) {
 }
 #endif
 
-// ---------------------------------------------------------------------------
-// Core 1 — navigation & control loop
-// ---------------------------------------------------------------------------
 void navigationTask(void* pv) {
     SystemContext* ctx = static_cast<SystemContext*>(pv);
     ctx->wdt->subscribeCurrentTask();
@@ -173,22 +164,19 @@ void navigationTask(void* pv) {
     const TickType_t period = pdMS_TO_TICKS(NAV_LOOP_PERIOD_MS);
     uint32_t lastLoopUs = micros();
 
-    // Held ADS samples: refreshed every WATER_ADS_EVERY_N_LOOPS ticks so the
-    // 20 Hz heading/motor path is not blocked by ~16 ms of ADC conversion.
+    // ADS ~16 ms — do not run every 50 ms tick.
     uint8_t waterAdsDiv = 0;
     WaterReading phR   = {NAN, false};
     WaterReading turbR = {NAN, false};
     bool anomaly = false;
 
     for (;;) {
-        // ---- Measured dt (clamped later inside PID) ----
         uint32_t nowUs = micros();
         float dt = (nowUs - lastLoopUs) / 1000000.0f;
         lastLoopUs = nowUs;
         if (dt < 0.001f) dt = 0.001f;
         if (dt > 0.25f)  dt = 0.25f;
 
-        // ---- 1. Sensor acquisition ----
         ctx->gps->update();
         ctx->compass->update();
         ctx->water->updateTemperatureNonBlocking();
@@ -200,7 +188,6 @@ void navigationTask(void* pv) {
         float  battV   = ctx->battery->readVoltage();
         int hour = ctx->gps->localHour();
 
-        // ---- 2. Water ADS + anomaly (rate-limited) ----
         const bool motionDisturbance =
             hadHardThrust &&
             (millis() - lastHardThrustMs) < ANOMALY_DISTURBANCE_MS;
@@ -213,8 +200,7 @@ void navigationTask(void* pv) {
                 phR.value, turbR.value, temp, sensorsValid, hour,
                 motionDisturbance);
         } else if (!phR.valid || !turbR.valid || !ctx->water->tempValid()) {
-            // Brief sensor glitch: suppress trigger only — do not call
-            // updateReadings(false) which would wipe Schmitt hysteresis.
+            // Don't call updateReadings(false) — that wipes hysteresis.
             anomaly = false;
         } else {
             anomaly = ctx->anomaly->shouldTriggerSpiral();
@@ -223,11 +209,6 @@ void navigationTask(void* pv) {
             waterAdsDiv = 0;
         }
 
-        // ---- 3. Drain inbound commands (nav owns command state updates too) ----
-        // Commands still arrive via EspNowLink::commandQueue; IO also drains them
-        // into ctx->command. We re-read under mutex below.
-
-        // ---- 3b. Drain waypoint queue HERE (single owner of Navigator) ----
         WaypointArrayPacket wps;
         while (EspNowLink::waypointQueue &&
                xQueueReceive(EspNowLink::waypointQueue, &wps, 0) == pdTRUE) {
@@ -255,23 +236,17 @@ void navigationTask(void* pv) {
                     ctx->ackDropCount++;
                 }
             }
-            // Waypoints alone no longer auto-START; need CMD_START_ARM.
         }
 
-        // ---- 4. Snapshot operator command ----
         CommandState cmd;
         if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             cmd = ctx->command;
             lastCmd = cmd;
             xSemaphoreGive(ctx->stateMutex);
         } else {
-            // Fail closed: retain the previous command snapshot instead of
-            // treating contention as "no emergency".
             cmd = lastCmd;
         }
 
-        // Seal multi-batch upload when shore says the last full (12/12) batch
-        // is done, or when START_ARM arrives (Start implies the list is complete).
         if (cmd.sealMissionUpload ||
             (cmd.start && ctx->nav->hasWaypoints() &&
              !ctx->nav->uploadComplete())) {
@@ -288,8 +263,7 @@ void navigationTask(void* pv) {
             }
         }
 
-        // Discard stale CLEAR / FORCE_RTH when they cannot apply — otherwise a
-        // CLEAR sent in STANDBY latches and auto-exits the *next* E-Stop.
+        // Stale CLEAR in STANDBY would auto-exit the next E-Stop.
         if (cmd.clearEstop && ctx->fsm->state() != STATE_EMERGENCY_STOP) {
             cmd.clearEstop = false;
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -373,22 +347,17 @@ void navigationTask(void* pv) {
             }
         }
 
-        // Dedicated ESP-NOW safety event cannot be lost when commandQueue is full.
-        // When CLEAR is pending, do NOT re-assert emergency from that event bit —
-        // otherwise FSM always sees emergencyCommand and CLEAR can never succeed
-        // (deadlock: pending cleared only after clearAccepted).
+        // Don't re-apply the EventGroup bit while CLEAR is in flight.
         if (EspNowLink::emergencyPending() && !cmd.clearEstop) {
             cmd.emergency = true;
         }
 
-        // GPS fault is latched. Only attempt CLEAR-driven unlatch while in E-Stop.
         if (cmd.clearEstop &&
             ctx->fsm->state() == STATE_EMERGENCY_STOP &&
             ctx->gps->clearFaultIfFresh()) {
             fix = ctx->gps->getFilteredFix();
         }
 
-        // Manual dead-man timeout.
         if (cmd.manualMode) {
             uint32_t age = millis() - cmd.lastManualMs;
             if (age > MANUAL_CMD_TIMEOUT_MS) {
@@ -404,12 +373,10 @@ void navigationTask(void* pv) {
             }
         }
 
-        // ---- 5. Safety (AA118 voltage only; load-aware RTH threshold) ----
         const bool underLoad = (lastAbsPwm >= BATTERY_LOAD_PWM_THRESH) ||
                                motionDisturbance;
         SafetyState safety = ctx->safety->evaluate(battV, underLoad);
 
-        // ---- 6. Mission FSM ----
         GpsLossTier gpsTier = ctx->gps->getLossTier();
         bool gpsOk = (gpsTier == GpsLossTier::OK) && fix.valid;
 
@@ -430,8 +397,6 @@ void navigationTask(void* pv) {
             }
         }
 
-        // Shore spiral is GRID-only. Drop it outside patrol so a later START
-        // cannot inherit a stale latch and loop GRID->SPIRAL.
         if (cmd.forceSpiral && ctx->fsm->state() != STATE_GRID_PATROL) {
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 ctx->command.forceSpiral = false;
@@ -459,8 +424,6 @@ void navigationTask(void* pv) {
                 g_homeLeft = true;
             }
         }
-        // Arrive only if this RTH started outside the 2 m bubble. GPS wander
-        // can set g_homeLeft while the boat is still on the START fix.
         in.arrivedHome      = g_homeSet && fix.valid &&
             isfinite(distHomeM) && isfinite(g_rthEntryDistM) &&
             (g_rthEntryDistM > RTH_ARRIVE_RADIUS_M) &&
@@ -476,8 +439,6 @@ void navigationTask(void* pv) {
         BoatState stateBefore = ctx->fsm->state();
         BoatState state = ctx->fsm->tick(in);
 
-        // Clear one-shot flags only when accepted. Keep START pending while
-        // waiting for GPS/compass/waypoints, but reject it on low battery.
         const bool startAccepted =
             stateBefore == STATE_STANDBY && state == STATE_GRID_PATROL;
         const bool startUnsafe =
@@ -496,7 +457,6 @@ void navigationTask(void* pv) {
                     ctx->command.start = false;
                 if (cmd.clearEstop && clearAccepted) {
                     ctx->command.clearEstop = false;
-                    // Clear dedicated E-Stop event only after FSM left ESTOP.
                     EspNowLink::clearEmergencyPending();
                 }
                 if (forceSpiralAccepted)
@@ -508,8 +468,6 @@ void navigationTask(void* pv) {
             Serial.println(F("[USV] FORCE_SPIRAL accepted"));
         }
 
-        // On entering E-Stop: clear start/manual/clear so we cannot auto-resume
-        // or auto-clear from a previously latched CLEAR_ESTOP.
         if (state == STATE_EMERGENCY_STOP && prevState != STATE_EMERGENCY_STOP) {
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 ctx->command.start = false;
@@ -523,8 +481,6 @@ void navigationTask(void* pv) {
             ctx->heading->reset();
         }
 
-        // Mission origin follows START. RTH home is CMD_SET_HOME; START
-        // only fills it if shore never latched a dock fix.
         if (state == STATE_GRID_PATROL && prevState == STATE_STANDBY) {
             if (fix.valid) {
                 g_homeLeft = false;
@@ -543,7 +499,6 @@ void navigationTask(void* pv) {
                     Serial.printf("[USV] start dist from home=%.1fm\n", startDist);
                 }
             } else {
-                // Should not happen (FSM requires gpsOk); stop as failsafe.
                 ctx->motor->stop();
             }
             ctx->heading->reset();
@@ -559,7 +514,6 @@ void navigationTask(void* pv) {
                 g_homeLat, g_homeLon, fix.lat, fix.lon);
         }
 
-        // Mission finished at home.
         if (state == STATE_STANDBY && prevState == STATE_RTH) {
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 ctx->command.start = false;
@@ -569,7 +523,6 @@ void navigationTask(void* pv) {
             ctx->heading->reset();
         }
 
-        // Spiral entry.
         if (state == STATE_SPIRAL_MAPPING && prevState != STATE_SPIRAL_MAPPING) {
             spiralDone = false;
             g_haveSpiralTgt = false;
@@ -578,18 +531,14 @@ void navigationTask(void* pv) {
             haveLastLosTarget = false;
         }
         if (state != STATE_SPIRAL_MAPPING) {
-            // Completion, RTH, E-Stop and GPS-fault exits all need cooldown;
-            // otherwise recovery can immediately re-enter SPIRAL.
             if (prevState == STATE_SPIRAL_MAPPING) {
                 ctx->anomaly->notifySpiralDone();
-                anomaly = false;  // local flag must match cooldown latch
+                anomaly = false;
             }
             spiralDone = false;
             g_spiralInitialized = false;
         }
 
-        // Announce stage/intent edges. current_mode in telemetry remains the
-        // 1 Hz heartbeat; this event adds why/next/upload progress.
         StageReportContext stageCtx = {};
         stageCtx.previousState = prevState;
         stageCtx.currentState = state;
@@ -614,7 +563,6 @@ void navigationTask(void* pv) {
             }
         }
 
-        // ---- 7. Act on state ----
         int leftPwm = 0, rightPwm = 0;
         bool navSensorsOk = gpsOk && compassOk;
 
@@ -637,9 +585,6 @@ void navigationTask(void* pv) {
                         fix.lat, fix.lon,
                         LOS_LOOKAHEAD_M, WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M);
 
-                    // Do not instantly skip WP1 merely because it is within the
-                    // 2.5 m acceptance disk at launch; require some along-track
-                    // progress on the first segment.
                     const bool reachedWithProgress =
                         los.reached &&
                         (ctx->nav->index() > 0 || los.alongTrackM >= 0.5f);
@@ -719,7 +664,6 @@ void navigationTask(void* pv) {
                     const float dist = isfinite(distHomeM) ? distHomeM :
                         (float)Navigator::calculateDistance(
                             fix.lat, fix.lon, g_homeLat, g_homeLon);
-                    // Started RTH already inside 2 m: hold mode 3, do not spin.
                     if (isfinite(g_rthEntryDistM) &&
                         g_rthEntryDistM <= RTH_ARRIVE_RADIUS_M &&
                         dist <= RTH_ARRIVE_RADIUS_M) {
@@ -740,7 +684,6 @@ void navigationTask(void* pv) {
             }
         }
 
-        // GPS safe-stop / fault: stop motors regardless of state.
         if (gpsTier == GpsLossTier::SAFE_STOP ||
             gpsTier == GpsLossTier::GPS_FAULT ||
             !fix.valid ||
@@ -750,7 +693,6 @@ void navigationTask(void* pv) {
             rightPwm = 0;
         }
 
-        // Track propulsion for battery sag + anomaly disturbance gating.
         const int absL = leftPwm < 0 ? -leftPwm : leftPwm;
         const int absR = rightPwm < 0 ? -rightPwm : rightPwm;
         lastAbsPwm = absL > absR ? absL : absR;
@@ -759,7 +701,6 @@ void navigationTask(void* pv) {
             hadHardThrust = true;
         }
 
-        // ---- 8. Publish telemetry snapshot (under mutex) ----
         TelemetryPacket logRec;
         memset(&logRec, 0, sizeof(logRec));
         bool snapshotPublished = false;
@@ -784,8 +725,6 @@ void navigationTask(void* pv) {
             ctx->homeDistM                 = distHomeM;
             ctx->homeSetFlag               = g_homeSet ? 1 : 0;
             logRec = ctx->snapshot;
-            // SD records have their own monotonic 20 Hz sequence. ESP-NOW
-            // sequence remains owned exclusively by ioTask.
             logRec.sequence_number = ++logSequence;
             snapshotPublished = true;
             xSemaphoreGive(ctx->stateMutex);
@@ -802,9 +741,6 @@ void navigationTask(void* pv) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Core 0 — comms & storage
-// ---------------------------------------------------------------------------
 void ioTask(void* pv) {
     SystemContext* ctx = static_cast<SystemContext*>(pv);
     ctx->wdt->subscribeCurrentTask();
@@ -818,11 +754,8 @@ void ioTask(void* pv) {
         pollCalButton(ctx);
         pollSerialCommands(ctx);
 
-        // ---- Drain inbound command queue ----
         CommandPacket cmdPkt;
         while (EspNowLink::commandQueue) {
-            // Acquire state storage before dequeueing so a mutex timeout can
-            // never discard a command.
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
                 break;
             }
@@ -868,7 +801,6 @@ void ioTask(void* pv) {
                     break;
                 case CMD_NORMAL:
                     ctx->command.forceRth = false;
-                    // Manual sticks apply only on CMD_NORMAL (not START/CLEAR/…).
                     {
                         const int manualSpeed =
                             constrain((int)cmdPkt.manual_speed, -255, 255);
@@ -906,7 +838,6 @@ void ioTask(void* pv) {
 #endif
         }
 
-        // ---- Drain ACK queue from nav -> shore ----
         WaypointACKPacket ack;
         while (EspNowLink::ackQueue &&
                xQueueReceive(EspNowLink::ackQueue, &ack, 0) == pdTRUE) {
@@ -922,7 +853,6 @@ void ioTask(void* pv) {
 #endif
         }
 
-        // ---- Drain stage/intent events from nav -> shore ----
         StageStatusPacket stageStatus;
         while (ctx->stageQueue &&
                xQueueReceive(ctx->stageQueue, &stageStatus, 0) == pdTRUE) {
@@ -958,7 +888,6 @@ void ioTask(void* pv) {
 #endif
         }
 
-        // ---- Periodic telemetry TX (1 Hz even if a send fails — do not spin) ----
         if (!ctx->radioTxPaused &&
             millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
             lastTelemetry = millis();
@@ -975,7 +904,6 @@ void ioTask(void* pv) {
                 }
                 const bool ok = ctx->link->sendTelemetry(tp);
                 if (ok) {
-                    // Mirror stamped seq back into telemetry snapshot only.
                     if (xSemaphoreTake(ctx->stateMutex,
                                        pdMS_TO_TICKS(5)) == pdTRUE) {
                         ctx->snapshot.sequence_number = tp.sequence_number;
@@ -999,15 +927,12 @@ void ioTask(void* pv) {
             }
         }
 
-        // ---- Optional battery report (same cadence as TELEMETRY: do not spin) ----
-        // Advancing only on TX success flooded ESP-NOW + Serial when the peer
-        // was down (~20 ms retries after the first 5 min window).
         if (!ctx->radioTxPaused &&
             millis() - lastBattReport >= BATTERY_REPORT_MS) {
             BatteryReportPacket br;
             br.report_timestamp = millis();
-            br.current_draw_ma  = 0.0f;  // no ACS712
-            br.estimated_tte_min = NAN;  // no current sensor -> cannot estimate
+            br.current_draw_ma  = 0.0f;
+            br.estimated_tte_min = NAN;
             bool haveBattery = false;
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 br.battery_voltage = ctx->batteryVoltage;
@@ -1029,7 +954,6 @@ void ioTask(void* pv) {
             }
         }
 
-        // ---- Drain log queue to SD (optional; SD may be absent) ----
         TelemetryPacket logRec;
         while (xQueueReceive(ctx->logQueue, &logRec, 0) == pdTRUE) {
             if (ctx->logger && ctx->logger->isReady()) {
@@ -1039,7 +963,6 @@ void ioTask(void* pv) {
             }
         }
 
-        // Periodic SD health check — mark logger not-ready if card vanished.
         if (ctx->logger &&
             millis() - lastSdCheck >= SD_INTEGRITY_MS) {
             lastSdCheck = millis();

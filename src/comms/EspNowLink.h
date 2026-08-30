@@ -18,10 +18,8 @@ public:
     bool sendBatteryReport(const BatteryReportPacket& pkt);
     bool sendStageStatus(StageStatusPacket& pkt);
 
-    // Inbound queues — drained by navigation task (waypoints) / IO task (commands).
     static QueueHandle_t commandQueue;
     static QueueHandle_t waypointQueue;
-    // Outbound ACK requests from nav task -> IO task.
     static QueueHandle_t ackQueue;
 
     static uint32_t droppedPackets;
@@ -34,9 +32,9 @@ public:
 
     enum TxResult : uint8_t {
         TX_RESULT_OK = 0,
-        TX_RESULT_SEND_ERR,  // esp_now_send() rejected the call
-        TX_RESULT_NO_ACK,    // callback: peer did not ACK
-        TX_RESULT_TIMEOUT    // no send callback within ESPNOW_TX_TIMEOUT_MS
+        TX_RESULT_SEND_ERR,
+        TX_RESULT_NO_ACK,
+        TX_RESULT_TIMEOUT
     };
 
     struct TxDiag {
@@ -52,18 +50,16 @@ public:
 
     static TxDiag lastTx;
     static const uint8_t* peerMac();
-    // ioTask only — each uses its own static buffer, not reentrant.
     static const char* describeLastTx();
     static const char* pairingHint();
 
-    // Dedicated latched safety path: an E-Stop cannot be lost when commandQueue is full.
     static bool emergencyPending();
     static void clearEmergencyPending();
 
 private:
     static uint8_t  _peerMac[6];
-    static uint32_t txSequence;    // telemetry stream, IO-task owned
-    static uint32_t stageSequence; // stage event stream, IO-task owned
+    static uint32_t txSequence;
+    static uint32_t stageSequence;
     static EventGroupHandle_t _safetyEvents;
     static SemaphoreHandle_t  _txDone;
     static volatile bool      _txOk;

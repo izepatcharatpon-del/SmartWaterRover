@@ -3,20 +3,13 @@
 
 #include <stdint.h>
 
-// =============================================================================
-// ESP-NOW wire packet contract (single source of truth).
-// Layout matches 2_Documentation/water_rover_system_plan.md exactly.
-// Share THIS FILE verbatim with the shore/gateway side (friend's project).
-// little-endian, packed structs. Sizes are enforced with static_assert below.
-// =============================================================================
+// Packed little-endian. Shore copies this file as-is.
+// Demux is by length: 5 / 194 / 38 / 2 / 20 / 12.
 
-// ---------- Shore -> Boat -----------------------------------------------------
-
-// General command / emergency button (5 bytes)
 typedef struct __attribute__((packed)) {
-    uint8_t sys_command;    // see CommandCode
-    int16_t manual_steer;   // -255..255
-    int16_t manual_speed;   // -255..255
+    uint8_t sys_command;
+    int16_t manual_steer;
+    int16_t manual_speed;
 } CommandPacket;
 
 typedef struct __attribute__((packed)) {
@@ -24,36 +17,29 @@ typedef struct __attribute__((packed)) {
     double lon;
 } Waypoint;
 
-// Patrol waypoint batch (194 bytes, max 12 points per packet)
 typedef struct __attribute__((packed)) {
-    uint8_t  packet_index;      // batch index (for multi-batch sends)
-    uint8_t  waypoint_count;    // valid points in this packet (<=12)
-    Waypoint waypoints[12];     // 12 * 16 = 192 bytes
+    uint8_t  packet_index;
+    uint8_t  waypoint_count;
+    Waypoint waypoints[12];
 } WaypointArrayPacket;
 
-// ---------- Boat -> Shore -----------------------------------------------------
-
-// Waypoint acknowledgement (2 bytes)
 typedef struct __attribute__((packed)) {
-    uint8_t packet_index;   // batch index being acknowledged
-    uint8_t ack_status;     // 0 = ACK, 1 = NACK (request resend)
+    uint8_t packet_index;
+    uint8_t ack_status;
 } WaypointACKPacket;
 
-// Live telemetry (38 bytes) sent every 1-2s
 typedef struct __attribute__((packed)) {
-    uint32_t sequence_number;   // monotonic, replay protection
+    uint32_t sequence_number;
     double   gps_lat;
     double   gps_lon;
-    // Water fields are NaN in STANDBY/ESTOP. Filled only while GRID/SPIRAL/RTH.
     float    water_ph;
-    float    water_turbidity;   // NTU
+    float    water_turbidity;
     float    water_temp;
-    uint8_t  current_mode;      // BoatState enum value
-    uint8_t  battery_percent;   // 0-100
-    float    heading_angle;     // compass degrees
+    uint8_t  current_mode;
+    uint8_t  battery_percent;
+    float    heading_angle;
 } TelemetryPacket;
 
-// Battery / power report (20 bytes), optional, ~every 5 min
 typedef struct __attribute__((packed)) {
     uint32_t report_timestamp;
     float    battery_voltage;
@@ -62,18 +48,16 @@ typedef struct __attribute__((packed)) {
     float    estimated_tte_min;
 } BatteryReportPacket;
 
-// Mission stage / intent event (12 bytes). Sent on status edges; telemetry
-// current_mode remains the 1 Hz heartbeat if this event is lost.
 typedef struct __attribute__((packed)) {
-    uint32_t sequence_number;     // monotonic within StageStatusPacket stream
-    uint8_t  current_stage;       // BoatState value: 0..4
-    uint8_t  intent;              // StageIntentCode
-    uint8_t  next_stage;          // BoatState value or STAGE_NEXT_DYNAMIC
-    uint8_t  reason;              // StageReasonCode
-    uint8_t  flags;               // StageStatusFlags bitmask
-    uint8_t  waypoint_count;      // total accepted points: 0..64
-    uint8_t  waypoint_index;      // active point (0-based), ==count when done
-    uint8_t  expected_batch_index;// next WaypointArrayPacket index
+    uint32_t sequence_number;
+    uint8_t  current_stage;
+    uint8_t  intent;
+    uint8_t  next_stage;
+    uint8_t  reason;
+    uint8_t  flags;
+    uint8_t  waypoint_count;
+    uint8_t  waypoint_index;
+    uint8_t  expected_batch_index;
 } StageStatusPacket;
 
 enum StageIntentCode {
@@ -103,7 +87,7 @@ enum StageReasonCode {
     STAGE_REASON_CRITICAL_SAFETY    = 10,
     STAGE_REASON_ARRIVED_HOME       = 11,
     STAGE_REASON_CLEAR_ESTOP        = 12,
-    STAGE_REASON_FORCE_SPIRAL       = 13  // shore CMD_FORCE_SPIRAL (not water anomaly)
+    STAGE_REASON_FORCE_SPIRAL       = 13
 };
 
 enum StageStatusFlags {
@@ -121,19 +105,15 @@ enum {
     STAGE_NEXT_DYNAMIC = 0xFF
 };
 
-// ---------- Command codes -----------------------------------------------------
-// Wire size of CommandPacket stays 5 bytes; only the meaning of sys_command grows.
 enum CommandCode {
-    CMD_NORMAL              = 0,  // idle / clear force-RTH latch (does NOT clear E-Stop)
-    CMD_EMERGENCY_STOP      = 1,  // latch E-Stop immediately
-    CMD_FORCE_RTH           = 2,  // force return-to-home
-    CMD_START_ARM           = 3,  // seal pending upload if any, then arm (needs GPS+compass)
-    CMD_CLEAR_ESTOP         = 4,  // explicit clear of latched E-Stop -> STANDBY
-    // Seal multi-batch waypoint upload when the last batch is full (count==12).
-    // Batches with waypoint_count < 12 auto-seal. Wire size unchanged.
+    CMD_NORMAL              = 0,
+    CMD_EMERGENCY_STOP      = 1,
+    CMD_FORCE_RTH           = 2,
+    CMD_START_ARM           = 3,
+    CMD_CLEAR_ESTOP         = 4,
     CMD_MISSION_UPLOAD_DONE = 5,
-    CMD_SET_HOME            = 6,  // latch current GPS as RTH home (STANDBY + fix)
-    CMD_FORCE_SPIRAL        = 7   // GRID -> spiral now (no water anomaly required)
+    CMD_SET_HOME            = 6,
+    CMD_FORCE_SPIRAL        = 7
 };
 
 enum AckStatus {
@@ -141,7 +121,6 @@ enum AckStatus {
     ACK_NACK = 1
 };
 
-// ---------- Wire-size guarantees (compile-time) -------------------------------
 #if defined(__cplusplus) && __cplusplus >= 201103L
 static_assert(sizeof(CommandPacket)      == 5,   "CommandPacket must be 5 bytes");
 static_assert(sizeof(Waypoint)           == 16,  "Waypoint must be 16 bytes");

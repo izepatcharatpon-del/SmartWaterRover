@@ -4,10 +4,11 @@
 .vscode/launch.json
 .vscode/ipch
 
-# Keep git firmware-only. Docs/sim/markdown stay on disk, not on remote.
+# Keep git firmware-only. Notes under docs/ stay on this machine.
 docs/
 simulation/
 *.md
+!README.md
 !.cursor/skills/**/SKILL.md
 *.log
 diff_*.txt

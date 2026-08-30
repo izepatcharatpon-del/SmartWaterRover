@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include "Packets.h"
 
-// Result of LOS guidance on the current segment (previous -> current waypoint).
 struct LosGuidance {
     float bearingDeg;      // heading to look-ahead point (0-360)
     float crossTrackM;     // signed cross-track error (m, + = right of track)
@@ -16,21 +15,17 @@ struct LosGuidance {
     bool  valid;
 };
 
-// Waypoint management + geodesic helpers + LOS segment tracking.
-// Pure math (no Arduino deps) so it is unit-testable on native.
 class Navigator {
 public:
     static const int MAX_WAYPOINTS = 64;
 
     Navigator();
 
-    // --- Static geodesy helpers (degrees in, meters / degrees out) ---
     static double calculateDistance(double lat1, double lon1,
-                                    double lat2, double lon2);      // meters
+                                    double lat2, double lon2);
     static double calculateBearing(double lat1, double lon1,
-                                   double lat2, double lon2);       // 0-360 deg
+                                   double lat2, double lon2);
 
-    // Local ENU offsets (metres) relative to a reference lat/lon.
     static void toLocalEnu(double refLat, double refLon,
                            double lat, double lon,
                            double& eastM, double& northM);
@@ -40,7 +35,6 @@ public:
 
     static bool isValidWaypoint(const Waypoint& wp);
 
-    // Replace list (tests / batch-0 path). Production uploads use acceptBatch.
     bool     loadWaypoints(const WaypointArrayPacket& pkt);
 
     bool     hasWaypoints() const { return _count > 0; }
@@ -52,9 +46,6 @@ public:
     bool     uploadComplete() const { return _missionUploadComplete; }
     uint8_t  expectedPacketIndex() const { return _expectedPacketIndex; }
 
-    // Idempotent multi-batch upload. STANDBY retries of the last packet ACK.
-    // Mid-mission / E-Stop (!allowNewMission) NACK every batch, including
-    // an identical last-packet retry.
     bool     acceptBatch(const WaypointArrayPacket& pkt, bool allowNewMission);
 
     void     sealMissionUpload();

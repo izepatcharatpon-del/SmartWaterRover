@@ -22,8 +22,6 @@
 #include "safety/SafetyManager.h"
 #include "core/MissionFsm.h"
 
-// Command flags produced by the IO task and consumed by the navigation task.
-// Protected by SystemContext::stateMutex.
 struct CommandState {
     bool     start;
     bool     clearEstop;

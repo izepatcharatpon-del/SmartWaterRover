@@ -59,7 +59,6 @@ static const char* espNowErrName(esp_err_t e) {
 
 void EspNowLink::onDataRecv(const uint8_t* mac_addr,
                             const uint8_t* data, int len) {
-    // Wi-Fi task context (not a classic ISR) — use task-level queue send.
     if (!mac_addr || memcmp(mac_addr, _peerMac, 6) != 0) {
         droppedPackets++;
         dropMac++;
@@ -75,8 +74,6 @@ void EspNowLink::onDataRecv(const uint8_t* mac_addr,
             return;
         }
         rxAcceptCount++;
-        // Set the dedicated event before queueing. Even if the queue is full,
-        // navTask observes the latched E-Stop bit.
         if (cmd.sys_command == CMD_EMERGENCY_STOP && _safetyEvents) {
             xEventGroupSetBits(_safetyEvents, ESTOP_EVENT_BIT);
         }
@@ -102,7 +99,6 @@ void EspNowLink::onDataRecv(const uint8_t* mac_addr,
 
 void EspNowLink::onDataSent(const uint8_t* /*mac_addr*/,
                             esp_now_send_status_t status) {
-    // Called from the Wi-Fi task (not a classic ISR).
     _txOk = (status == ESP_NOW_SEND_SUCCESS);
     if (_txDone) {
         xSemaphoreGive(_txDone);
@@ -124,7 +120,6 @@ bool EspNowLink::sendWithConfirm(const uint8_t* data, size_t len) {
     for (int attempt = 0; attempt < ESPNOW_TX_RETRIES; attempt++) {
         lastTx.attemptsUsed = (uint8_t)(attempt + 1);
         if (_txDone) {
-            // Drain a stale give from a previous send.
             xSemaphoreTake(_txDone, 0);
         }
         _txOk = false;
@@ -145,7 +140,6 @@ bool EspNowLink::sendWithConfirm(const uint8_t* data, size_t len) {
             lastTx.noAckCount++;
             lastTx.result = TX_RESULT_NO_ACK;
         } else if (!_txDone) {
-            // Callback not available — treat esp_now_send OK as best-effort success.
             lastTx.result = TX_RESULT_OK;
             lastTx.sendErr = ESP_OK;
             return true;
@@ -237,8 +231,7 @@ bool EspNowLink::begin(uint8_t channel, const uint8_t peerMac[6]) {
 
     esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
                                        WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
-    // STA default is modem sleep; ESP-NOW unicast ACK is lost if the radio
-    // sleeps before the peer's ACK. Both ends need WIFI_PS_NONE.
+    // Modem sleep drops ESP-NOW ACKs. Both ends need WIFI_PS_NONE.
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     if (esp_now_init() != ESP_OK) return false;

@@ -26,7 +26,6 @@ float WaterAnomalyMonitor::sma(const float* buf) const {
 }
 
 float WaterAnomalyMonitor::phHighLimitForHour(int hour) const {
-    // Unknown GPS time: use day (looser) ceiling to avoid dawn false spirals.
     if (hour < 0) return PH_HIGH_LIMIT_DAY;
     if (hour >= 12 && hour < 17) return PH_HIGH_LIMIT_DAY;
     return PH_HIGH_LIMIT_NIGHT;
@@ -35,7 +34,6 @@ float WaterAnomalyMonitor::phHighLimitForHour(int hour) const {
 bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
                                          bool sensorsValid, int hour,
                                          bool motionDisturbance) {
-    // Sensor fault: suppress trigger but keep Schmitt latch (avoid glitch reset).
     if (!sensorsValid) {
         _triggerSpiral = false;
         return false;
@@ -52,7 +50,6 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
     float phAvg   = sma(_phBuf);
     float turbAvg = sma(_turbBuf);
 
-    // ROC over a fixed ≥2 s window so ~4 Hz ADS noise cannot inflate NTU/min.
     if (!_haveLastTurb) {
         _lastTurb = turbAvg;
         _lastRocMs = now;
@@ -78,11 +75,9 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
     bool turbHigh = (turbAvg > TURBIDITY_WASTEWATER_NTU);
     bool turbSpike = (_turbRoc > TURBIDITY_ROC_LIMIT);
     if (motionDisturbance) {
-        // Prop wash / hard turns often spike ROC without real wastewater.
         turbSpike = false;
     }
 
-    // Sustained rise above slow baseline (catches slow pollution < absolute NTU).
     bool baselineRising = (baselineDev > ANOMALY_BASELINE_DELTA_NTU);
     if (baselineRising) {
         if (!_baselineHighActive) {
@@ -96,8 +91,6 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
         _baselineHighActive &&
         (now - _baselineHighSince >= ANOMALY_BASELINE_DWELL_MS);
 
-    // Score is telemetry/debug only — ammonia equilibrium fraction is NOT a
-    // standalone trigger (needs real TAN; pH alone already covers chemistry).
     (void)temp;
     float score = 0.0f;
     if (turbAvg > TURBIDITY_WARNING_NTU)

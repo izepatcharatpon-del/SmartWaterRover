@@ -21,15 +21,12 @@ void HeadingController::calculateThrusterOutputs(float targetBearing, float curr
     float error = computeHeadingError(targetBearing, currentHeading);
     float correction = _pid.update(error, dt);
 
-    // Turn-first: when heading error is large, cancel forward thrust.
     int effectiveBase = basePwm;
     if (fabsf(error) > LOS_TURN_FIRST_DEG) {
         effectiveBase = 0;
     }
 
     if (effectiveBase == 0) {
-        // Turn in place. Avoid mapping a tiny 1-degree PID output to ±80,
-        // which causes limit-cycle oscillation around the target heading.
         if (fabsf(error) <= HEADING_STOP_TOL_DEG) {
             leftPwm = 0;
             rightPwm = 0;
@@ -40,13 +37,9 @@ void HeadingController::calculateThrusterOutputs(float targetBearing, float curr
             rightPwm = -leftPwm;
         }
     } else {
-        // Base PWM is chosen above motor deadband; preserve proportional
-        // differential instead of independently snapping each side to ±80.
         leftPwm  = effectiveBase + (int)correction;
         rightPwm = effectiveBase - (int)correction;
 
-        // After ±correction a side can land in (0, MOTOR_MIN_PWM) where the
-        // driver produces no motion — lift out of the hardware deadband.
         auto liftDeadband = [](int v) -> int {
             if (v == 0) return 0;
             if (v > 0 && v < MOTOR_MIN_PWM) return MOTOR_MIN_PWM;

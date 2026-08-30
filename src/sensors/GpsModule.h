@@ -12,11 +12,10 @@ struct GpsFix {
     bool    valid;
 };
 
-// GPS degradation policy (no dead reckoning — open-pond risk).
 enum class GpsLossTier {
-    OK,           // loss timer has not reached SAFE_STOP; fix.valid is still freshness-gated
-    SAFE_STOP,    // temporary motor stop; resume when fix returns
-    GPS_FAULT     // latched prolonged loss — stop and escalate
+    OK,
+    SAFE_STOP,
+    GPS_FAULT
 };
 
 class GpsModule {
@@ -33,7 +32,7 @@ public:
     GpsLossTier getLossTier();
     unsigned long timeSinceFix() const;
     bool        hasTime() const;
-    int         localHour() const;   // 0-23 with configured timezone; -1 if unknown
+    int         localHour() const;
 
 private:
     TinyGPSPlus   _gps;

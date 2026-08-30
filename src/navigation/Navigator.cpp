@@ -39,7 +39,6 @@ double Navigator::calculateDistance(double lat1, double lon1,
     double a = sin(dLat / 2.0) * sin(dLat / 2.0) +
                cos(lat1 * DEG2RAD) * cos(lat2 * DEG2RAD) *
                sin(dLon / 2.0) * sin(dLon / 2.0);
-    // Clamp against floating-point overshoot that would NaN sqrt(1-a).
     if (a < 0.0) a = 0.0;
     if (a > 1.0) a = 1.0;
     double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
@@ -101,7 +100,6 @@ void Navigator::setMissionOrigin(double lat, double lon) {
 }
 
 bool Navigator::loadWaypoints(const WaypointArrayPacket& pkt) {
-    // Validate before mutating: a corrupt batch 0 must not wipe a valid mission.
     if (!validateBatch(pkt, MAX_WAYPOINTS)) return false;
 
     clear();
@@ -112,7 +110,6 @@ bool Navigator::loadWaypoints(const WaypointArrayPacket& pkt) {
 }
 
 bool Navigator::appendBatch(const WaypointArrayPacket& pkt) {
-    // Validate the whole packet and capacity first; append atomically afterwards.
     if (!validateBatch(pkt, MAX_WAYPOINTS - _count)) return false;
     for (uint8_t i = 0; i < pkt.waypoint_count; i++) {
         _wps[_count++] = pkt.waypoints[i];
@@ -121,8 +118,6 @@ bool Navigator::appendBatch(const WaypointArrayPacket& pkt) {
 }
 
 uint32_t Navigator::packetHash(const WaypointArrayPacket& pkt) {
-    // FNV-1a over semantic fields only. Ignore unused waypoint slots because
-    // gateway retries may not zero-fill them identically.
     uint32_t hash = 2166136261u;
     auto addBytes = [&hash](const void* ptr, size_t len) {
         const uint8_t* bytes = reinterpret_cast<const uint8_t*>(ptr);
@@ -150,9 +145,6 @@ bool Navigator::validateBatch(const WaypointArrayPacket& pkt, int availableSlots
 bool Navigator::acceptBatch(const WaypointArrayPacket& pkt, bool allowNewMission) {
     const uint32_t hash = packetHash(pkt);
 
-    // Duplicate of the last accepted packet: ACK only in STANDBY. Outside
-    // STANDBY a retry of the old last batch must NACK so shore does not treat
-    // a rejected re-upload (new idx 0/1, coincidental idx 2) as success.
     if (_haveAcceptedPacket &&
         pkt.packet_index == _lastAcceptedPacketIndex &&
         hash == _lastAcceptedPacketHash) {
@@ -168,7 +160,6 @@ bool Navigator::acceptBatch(const WaypointArrayPacket& pkt, bool allowNewMission
         return true;
     }
 
-    // Mid-mission / E-Stop: reject ALL batches, including non-duplicates.
     if (!allowNewMission) return false;
 
     if (pkt.packet_index == 0) {
@@ -210,7 +201,6 @@ Waypoint Navigator::segmentStart() const {
         Waypoint o = {_originLat, _originLon};
         return o;
     }
-    // Fallback: use current target as both ends (degenerate segment).
     return currentTarget();
 }
 
@@ -246,7 +236,7 @@ LosGuidance Navigator::computeLos(double lat, double lon,
     g.reached = (g.distToEndM <= (float)radiusM);
 
     double se, sn, ee, en, pe, pn;
-    toLocalEnu(start.lat, start.lon, start.lat, start.lon, se, sn); // 0,0
+    toLocalEnu(start.lat, start.lon, start.lat, start.lon, se, sn);
     (void)se; (void)sn;
     toLocalEnu(start.lat, start.lon, end.lat, end.lon, ee, en);
     toLocalEnu(start.lat, start.lon, lat, lon, pe, pn);
@@ -257,7 +247,6 @@ LosGuidance Navigator::computeLos(double lat, double lon,
     double segLen = sqrt(segLen2);
 
     if (segLen < 0.05) {
-        // Degenerate: point-chase the end.
         g.bearingDeg = (float)calculateBearing(lat, lon, end.lat, end.lon);
         g.lookAheadDistM = g.distToEndM;
         g.passed = false;
@@ -265,18 +254,13 @@ LosGuidance Navigator::computeLos(double lat, double lon,
         return g;
     }
 
-    // Projection of boat onto segment: t in [0, 1+] (allow past end).
     double t = ((pe - 0.0) * segEx + (pn - 0.0) * segNy) / segLen2;
-    double projE = 0.0 + t * segEx;
-    double projN = 0.0 + t * segNy;
 
-    // Cross-track: signed left(+)/right(-) of track direction via 2D cross.
     g.crossTrackM = (float)(((pe - 0.0) * segNy - (pn - 0.0) * segEx) / segLen);
     g.alongTrackM = (float)(t * segLen);
 
     g.passed = (t >= 1.0) && (g.alongTrackM >= (float)(segLen + passMarginM));
 
-    // Look-ahead along segment from projection (clamped to end).
     double alongFromStart = t * segLen + lookaheadM;
     if (alongFromStart > segLen) alongFromStart = segLen;
     if (alongFromStart < 0.0) alongFromStart = 0.0;

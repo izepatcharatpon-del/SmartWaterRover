@@ -32,7 +32,6 @@ uint8_t StageReporter::deriveIntent(const StageReportContext& ctx) {
         return STAGE_INTENT_WAIT_START;
     }
 
-    // Active navigation is motor-gated whenever either nav sensor is unusable.
     if (!ctx.fsm.gpsOk || !ctx.fsm.compassOk) {
         return STAGE_INTENT_WAIT_NAV_READY;
     }
@@ -75,7 +74,6 @@ uint8_t StageReporter::deriveNextStage(const StageReportContext& ctx) {
 }
 
 uint8_t StageReporter::deriveReason(const StageReportContext& ctx) {
-    // A safety transition on the first loop is more important than BOOT.
     if (ctx.initialReport && ctx.previousState == ctx.currentState) {
         return STAGE_REASON_BOOT;
     }

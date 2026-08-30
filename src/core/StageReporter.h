@@ -19,13 +19,10 @@ struct StageReportContext {
     uint8_t   expectedBatchIndex;
 };
 
-// Pure formatter for the nav-owned FSM state. ESP-NOW sequence stamping and
-// transmission remain owned by ioTask.
 class StageReporter {
 public:
     static StageStatusPacket build(const StageReportContext& ctx);
 
-    // Ignores sequence/reason and noisy readiness bits when detecting an edge.
     static bool sameStatus(const StageStatusPacket& a,
                            const StageStatusPacket& b);
 

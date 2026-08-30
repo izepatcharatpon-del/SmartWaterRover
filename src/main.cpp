@@ -23,7 +23,6 @@ static MissionFsm          fsm;
 
 static SystemContext ctx;
 
-// TODO: replace with the shore/gateway board's real MAC.
 static uint8_t GATEWAY_MAC[6] = {0x88, 0x57, 0x21, 0xAD, 0xAE, 0x8C};
 static const uint8_t DUMMY_GATEWAY_MAC[6] = {0x24, 0x6F, 0x28, 0x00, 0x00, 0x01};
 
@@ -82,8 +81,6 @@ static void haltFatal(const char* msg) {
 
 void setup() {
     Serial.begin(115200);
-    // Do not send ESP-IDF WiFi/ESP-NOW logs to UART. CORE_DEBUG_LEVEL=3 used
-    // to stall core 0 when the USB-UART chip is unpowered (battery / BEC 5V).
     Serial.setDebugOutput(false);
     delay(200);
     Serial.println(F("[USV] boot"));
@@ -127,8 +124,6 @@ void setup() {
     if (loggerOk) {
         Serial.println(F("[USV] SD logger OK (SdFat)"));
     } else {
-        // SD is optional: boat must still run without a card. ioTask skips
-        // logRecord when logger is null / not ready.
         Serial.println(F("[USV] SD logger init FAILED — continuing without SD"));
     }
 
@@ -166,7 +161,6 @@ void setup() {
                                   sizeof(StageStatusPacket));
     ctx.stateMutex = xSemaphoreCreateMutex();
 
-    // RTOS queues/mutex are required; the SD device itself remains optional.
     if (!commsOk || !ctx.logQueue || !ctx.stageQueue || !ctx.stateMutex) {
         haltFatal("[FATAL] init failed (comms/queue/mutex)");
     }

@@ -71,7 +71,6 @@ bool GpsModule::update() {
 
 bool GpsModule::isFixValid() {
     if (!_gps.location.isValid()) return false;
-    // Prefer age-aware checks when TinyGPSPlus provides them.
     if (_gps.location.age() > GPS_FRESH_FIX_MS) return false;
     uint8_t sats = _gps.satellites.isValid() ? _gps.satellites.value() : 0;
     float   hdop = _gps.hdop.isValid() ? _gps.hdop.hdop() : 99.0f;
@@ -98,7 +97,6 @@ double GpsModule::filterAlpha() const {
         const_cast<TinyGPSSpeed&>(_gps.speed).age() < GPS_FRESH_FIX_MS) {
         speedKmh = (float)const_cast<TinyGPSSpeed&>(_gps.speed).kmph();
     }
-    // Moving with decent HDOP → track faster (less LOS lag). Poor HDOP stays smooth.
     if (speedKmh >= GPS_FILTER_SPEED_KMH && hdop <= GPS_FILTER_HDOP_GOOD) {
         return (double)GPS_FILTER_ALPHA_FAST;
     }
@@ -115,7 +113,6 @@ void GpsModule::applyLowPassFilter(double lat, double lon) {
     const double alpha = filterAlpha();
     _filtLat = alpha * lat + (1.0 - alpha) * _filtLat;
 
-    // Wrap longitude error across ±180° before blending.
     double dLon = lon - _filtLon;
     while (dLon > 180.0)  dLon -= 360.0;
     while (dLon < -180.0) dLon += 360.0;
@@ -130,7 +127,6 @@ GpsFix GpsModule::getFilteredFix() {
     fix.lon   = _filtLon;
     fix.hdop  = _gps.hdop.isValid() ? _gps.hdop.hdop() : 99.0f;
     fix.sats  = _gps.satellites.isValid() ? _gps.satellites.value() : 0;
-    // Never navigate or declare arrival from held/stale coordinates.
     fix.valid = _filterInit && !_faultLatched && hasFreshFix();
     return fix;
 }
@@ -143,8 +139,6 @@ unsigned long GpsModule::timeSinceFix() const {
 GpsLossTier GpsModule::getLossTier() {
     if (_faultLatched) return GpsLossTier::GPS_FAULT;
 
-    // No quality fix since boot: not OK, but do not latch FAULT until we have
-    // acquired then lost a fix for GPS_LOSS_FAULT_MS.
     if (!_everHadFix) return GpsLossTier::SAFE_STOP;
 
     unsigned long elapsed = timeSinceFix();
