@@ -11,4 +11,4 @@ simulation/
 !README.md
 !.cursor/skills/**/SKILL.md
 *.log
-diff_*.txt
+*.txt
