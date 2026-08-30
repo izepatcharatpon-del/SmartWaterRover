@@ -19,6 +19,7 @@ struct FsmInputs {
     bool        clearEstop;       // CMD_CLEAR_ESTOP
     bool        emergencyCommand; // CMD_EMERGENCY_STOP
     bool        forceRthCommand;  // CMD_FORCE_RTH
+    bool        forceSpiralCommand; // CMD_FORCE_SPIRAL (GRID only, one-shot)
     bool        anomalyDetected;  // WaterAnomalyMonitor (after hysteresis)
     bool        spiralComplete;   // SpiralPlanner finished all turns
     bool        gridComplete;     // Navigator ran out of patrol waypoints

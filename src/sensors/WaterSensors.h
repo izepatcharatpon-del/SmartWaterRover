@@ -32,6 +32,8 @@ public:
 
     WaterReading readPh(float tempC);
     WaterReading readTurbidityNtu();
+    // Last ADS A1 volts from readTurbidityNtu (kept even when NTU is invalid).
+    float lastTurbVoltage() const { return _lastTurbVoltage; }
 
     // --- pH calibration (buffers @ 25 °C) ---
     bool  samplePhVoltage(float& outV, int samples = 30);
@@ -73,6 +75,7 @@ private:
 
     float _vCap401, _vCap686, _vCap918;
     bool  _cap401, _cap686, _cap918;
+    float _lastTurbVoltage;
 
     bool readChannelVoltage(uint8_t channel, float& outV);
     float phFromVoltageCalibrated(float volts, float tempC) const;

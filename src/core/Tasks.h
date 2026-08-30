@@ -36,6 +36,8 @@ struct CommandState {
     uint32_t lastManualMs;
     bool     compassCalStart;
     bool     compassCalClear;
+    bool     setHome;
+    bool     forceSpiral;
 };
 
 struct SystemContext {
@@ -61,6 +63,7 @@ struct SystemContext {
     TelemetryPacket   snapshot;
     CommandState      command;
     float             batteryVoltage;
+    float             turbVoltage;
     uint8_t           compassAddr;
     uint8_t           compassFailCount;
     uint8_t           compassFresh;
@@ -68,6 +71,8 @@ struct SystemContext {
     int16_t           compassRawY;
     uint8_t           compassNvs;
     uint8_t           compassCalRun;
+    float             homeDistM;
+    uint8_t           homeSetFlag;
     uint32_t          logDropCount;
     uint32_t          ackDropCount;
     uint32_t          stageDropCount;

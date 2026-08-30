@@ -154,7 +154,13 @@ float Compass::getHeadingDeg() {
 
     float heading = atan2f(y, x) * 180.0f / (float)M_PI;
     if (heading < 0.0f) heading += 360.0f;
-    return applyDeclination(heading);
+    heading += COMPASS_YAW_OFFSET_DEG;
+    heading = applyDeclination(heading);
+    if (COMPASS_YAW_MIRROR) {
+        heading = 360.0f - heading;
+        if (heading >= 360.0f) heading -= 360.0f;
+    }
+    return heading;
 }
 
 void Compass::setFactoryHardIron() {

@@ -513,6 +513,14 @@ void test_stage_reporter_transition_reasons(void) {
     TEST_ASSERT_EQUAL_UINT8(STAGE_REASON_ANOMALY_DETECTED, status.reason);
     TEST_ASSERT_EQUAL_UINT8(STATE_GRID_PATROL, status.next_stage);
 
+    ctx.fsm.anomalyDetected = false;
+    ctx.fsm.forceSpiralCommand = true;
+    status = StageReporter::build(ctx);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_INTENT_MAP_ANOMALY, status.intent);
+    TEST_ASSERT_EQUAL_UINT8(STAGE_REASON_FORCE_SPIRAL, status.reason);
+    TEST_ASSERT_EQUAL_UINT8(STATE_GRID_PATROL, status.next_stage);
+    ctx.fsm.forceSpiralCommand = false;
+
     ctx.previousState = STATE_SPIRAL_MAPPING;
     ctx.currentState = STATE_EMERGENCY_STOP;
     ctx.initialReport = true;
@@ -536,6 +544,11 @@ void test_stage_reporter_edge_filter_ignores_readiness_chatter(void) {
     ctx.fsm.gpsOk = false;
     StageStatusPacket b = StageReporter::build(ctx);
     TEST_ASSERT_TRUE(StageReporter::sameStatus(a, b));
+
+    ctx.homeSet = true;
+    b = StageReporter::build(ctx);
+    TEST_ASSERT_FALSE(StageReporter::sameStatus(a, b));
+    ctx.homeSet = false;
 
     ctx.fsm.startCommand = true;
     b = StageReporter::build(ctx);
@@ -621,6 +634,46 @@ void test_fsm_start_needs_waypoints(void) {
     TEST_ASSERT_EQUAL(STATE_STANDBY, fsm.tick(in));
 }
 
+void test_fsm_force_spiral_from_grid(void) {
+    MissionFsm fsm;
+    fsm.begin();
+    FsmInputs in = baseInputs();
+    in.startCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.startCommand = false;
+
+    in.forceSpiralCommand = true;
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, fsm.tick(in));
+
+    // One-shot: leaving the flag set would re-enter spiral after mapping.
+    in.forceSpiralCommand = false;
+    in.spiralComplete = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.spiralComplete = false;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+}
+
+void test_fsm_force_spiral_ignored_in_standby(void) {
+    MissionFsm fsm;
+    fsm.begin();
+    FsmInputs in = baseInputs();
+    in.forceSpiralCommand = true;
+    TEST_ASSERT_EQUAL(STATE_STANDBY, fsm.tick(in));
+}
+
+void test_fsm_force_rth_wins_over_force_spiral(void) {
+    MissionFsm fsm;
+    fsm.begin();
+    FsmInputs in = baseInputs();
+    in.startCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.startCommand = false;
+
+    in.forceSpiralCommand = true;
+    in.forceRthCommand = true;
+    TEST_ASSERT_EQUAL(STATE_RTH, fsm.tick(in));
+}
+
 void test_fsm_start_blocked_on_low_battery(void) {
     MissionFsm fsm;
     fsm.begin();
@@ -687,6 +740,9 @@ int main(int, char**) {
     RUN_TEST(test_fsm_clear_ignored_outside_estop);
     RUN_TEST(test_fsm_force_rth_without_home_is_estop);
     RUN_TEST(test_fsm_start_needs_waypoints);
+    RUN_TEST(test_fsm_force_spiral_from_grid);
+    RUN_TEST(test_fsm_force_spiral_ignored_in_standby);
+    RUN_TEST(test_fsm_force_rth_wins_over_force_spiral);
     RUN_TEST(test_fsm_start_blocked_on_low_battery);
     RUN_TEST(test_fsm_gps_fault_latches_estop);
     return UNITY_END();

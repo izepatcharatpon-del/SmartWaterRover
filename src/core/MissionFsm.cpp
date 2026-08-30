@@ -46,7 +46,8 @@ BoatState MissionFsm::tick(const FsmInputs& in) {
             break;
 
         case STATE_GRID_PATROL:
-            if (in.anomalyDetected)   _state = STATE_SPIRAL_MAPPING;
+            if (in.anomalyDetected || in.forceSpiralCommand)
+                _state = STATE_SPIRAL_MAPPING;
             else if (in.gridComplete) _state = in.homeSet ? STATE_RTH : STATE_STANDBY;
             break;
 

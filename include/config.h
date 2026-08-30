@@ -15,6 +15,11 @@
 #define ADS1115_I2C_ADDR       0x48
 // Magnetic declination (degrees, east positive). Approx. central Thailand.
 #define MAGNETIC_DECLINATION_DEG (-0.6f)
+// Added after atan2 so chip axes need not match the bow. Positive = clockwise.
+// 2026-08-27: bow north → hdg=88.6 with offset -100. Set to -100-88.6.
+#define COMPASS_YAW_OFFSET_DEG   (-188.6f)
+// 1 = reverse yaw sense (360-hdg). Phone 60° read 300° while north stayed 0.
+#define COMPASS_YAW_MIRROR       1
 // Hard-iron factory fallback (raw min/max). Equal ±span is identity-ish.
 // Runtime spin cal (Serial CALMAG) overrides these via NVS namespace usv_mag.
 #define COMPASS_X_MIN          (-2048.0f)
@@ -89,10 +94,15 @@
 #define HEADING_KD             0.80f
 #define PID_DERIV_ALPHA        0.30f
 #define WAYPOINT_RADIUS_M      2.5f
-#define LOS_LOOKAHEAD_M        4.0f
+#define LOS_LOOKAHEAD_M        2.5f   // shorter than 4 m → tighter turns
 #define LOS_PASS_MARGIN_M      0.5f
 #define LOS_NEAR_SLOW_M        5.0f
-#define LOS_TURN_FIRST_DEG     60.0f
+#define LOS_TURN_FIRST_DEG     35.0f  // in-place below this; 60° carved a wide arc
+// Complete RTH only if it started outside the arrive bubble (not the START fix)
+// and after a hold so GPS jitter cannot STANDBY in <1 s.
+#define RTH_DEPART_RADIUS_M    12.0f
+#define RTH_ARRIVE_RADIUS_M    2.0f
+#define RTH_MIN_HOLD_MS        3000UL
 #define HEADING_STOP_TOL_DEG   3.0f
 #define MANUAL_CMD_TIMEOUT_MS  500UL
 
@@ -124,6 +134,9 @@
 #define TURBIDITY_FAULT_V      2.50f      // below → open-wire / invalid
 #define TURBIDITY_NTU_SCALE    1.00f
 #define TURBIDITY_NTU_OFFSET   0.00f
+// Bench 2026-08-24: wet/dry/cover all stuck ~3.70 V — analog is not optical.
+// Keep 0 so fake ~1500 NTU cannot trigger spiral. Set 1 after turbV changes.
+#define TURBIDITY_OPTICS_OK    0
 
 // ----------------------- Anomaly / wastewater --------------------------------
 #define ANOMALY_CLEAR_HYST_NTU 10.0f
@@ -161,7 +174,7 @@
 #define GPS_LOSS_FAULT_MS      120000UL
 
 // ----------------------- ESP-NOW / logging / WDT -----------------------------
-#define ESPNOW_WIFI_CHANNEL    9
+#define ESPNOW_WIFI_CHANNEL    6
 #define TELEMETRY_INTERVAL_MS  1000
 // 1 = dump ESP-NOW TX/RX fields on Serial (same COM as [USV]). Pairing bench
 // only; ioTask prints TEL/ACK/STAGE/BATT + RX CMD. Nav prints RX WP batches.

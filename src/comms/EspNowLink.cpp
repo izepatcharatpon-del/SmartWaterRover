@@ -69,7 +69,7 @@ void EspNowLink::onDataRecv(const uint8_t* mac_addr,
     if (len == (int)sizeof(CommandPacket)) {
         CommandPacket cmd;
         memcpy(&cmd, data, sizeof(cmd));
-        if (cmd.sys_command > CMD_MISSION_UPLOAD_DONE) {
+        if (cmd.sys_command > CMD_FORCE_SPIRAL) {
             droppedPackets++;
             dropCmd++;
             return;

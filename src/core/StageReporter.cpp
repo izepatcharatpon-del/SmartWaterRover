@@ -58,7 +58,8 @@ uint8_t StageReporter::deriveNextStage(const StageReportContext& ctx) {
         case STATE_STANDBY:
             return STATE_GRID_PATROL;
         case STATE_GRID_PATROL:
-            if (ctx.fsm.anomalyDetected) return STATE_SPIRAL_MAPPING;
+            if (ctx.fsm.anomalyDetected || ctx.fsm.forceSpiralCommand)
+                return STATE_SPIRAL_MAPPING;
             if (ctx.fsm.gridComplete) {
                 return ctx.fsm.homeSet ? STATE_RTH : STATE_STANDBY;
             }
@@ -103,6 +104,8 @@ uint8_t StageReporter::deriveReason(const StageReportContext& ctx) {
     }
 
     if (ctx.currentState == STATE_SPIRAL_MAPPING) {
+        if (ctx.fsm.anomalyDetected) return STAGE_REASON_ANOMALY_DETECTED;
+        if (ctx.fsm.forceSpiralCommand) return STAGE_REASON_FORCE_SPIRAL;
         return STAGE_REASON_ANOMALY_DETECTED;
     }
 
@@ -161,7 +164,8 @@ bool StageReporter::sameStatus(const StageStatusPacket& a,
         STAGE_FLAG_UPLOAD_COMPLETE |
         STAGE_FLAG_MISSION_READY |
         STAGE_FLAG_START_PENDING |
-        STAGE_FLAG_MANUAL_ACTIVE;
+        STAGE_FLAG_MANUAL_ACTIVE |
+        STAGE_FLAG_HOME_SET;
 
     return a.current_stage == b.current_stage &&
            a.intent == b.intent &&

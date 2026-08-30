@@ -7,11 +7,22 @@
 // Home position — captured on every STANDBY -> GRID_PATROL with valid GPS.
 static double g_homeLat = 0.0, g_homeLon = 0.0;
 static bool   g_homeSet = false;
+static bool   g_homeLeft = false;  // GPS dist >= RTH_DEPART (log only)
+static float    g_rthEntryDistM = NAN;
+static uint32_t g_rthEnterMs = 0;
 
 // Spiral chase target.
 static Waypoint g_spiralTgt = {0.0, 0.0};
 static bool     g_haveSpiralTgt = false;
 static bool     g_spiralInitialized = false;
+
+// Shore gets GPS/heading/mode/batt in every 1 Hz heartbeat. Water quality
+// rides the same 38 B packet but only while a mission is actually running.
+static bool radioSendsWaterQuality(uint8_t mode) {
+    return mode == STATE_GRID_PATROL ||
+           mode == STATE_SPIRAL_MAPPING ||
+           mode == STATE_RTH;
+}
 
 static int chooseBasePwm(float headingErrorDeg, float distToEndM, int cruisePwm) {
     float absErr = fabsf(headingErrorDeg);
@@ -131,6 +142,8 @@ static const char* radioCmdName(uint8_t code) {
         case CMD_START_ARM:           return "START_ARM";
         case CMD_CLEAR_ESTOP:         return "CLEAR_ESTOP";
         case CMD_MISSION_UPLOAD_DONE: return "UPLOAD_DONE";
+        case CMD_SET_HOME:            return "SET_HOME";
+        case CMD_FORCE_SPIRAL:        return "FORCE_SPIRAL";
         default:                      return "?";
     }
 }
@@ -400,18 +413,59 @@ void navigationTask(void* pv) {
         GpsLossTier gpsTier = ctx->gps->getLossTier();
         bool gpsOk = (gpsTier == GpsLossTier::OK) && fix.valid;
 
+        if (cmd.setHome) {
+            if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                ctx->command.setHome = false;
+                xSemaphoreGive(ctx->stateMutex);
+            }
+            if (ctx->fsm->state() == STATE_STANDBY && gpsOk && fix.valid) {
+                g_homeLat = fix.lat;
+                g_homeLon = fix.lon;
+                g_homeSet = true;
+                g_homeLeft = false;
+                Serial.printf("[USV] SET_HOME lat=%.6f lon=%.6f\n",
+                              g_homeLat, g_homeLon);
+            } else {
+                Serial.println(F("[USV] SET_HOME refused — need STANDBY and GPS OK"));
+            }
+        }
+
+        // Shore spiral is GRID-only. Drop it outside patrol so a later START
+        // cannot inherit a stale latch and loop GRID->SPIRAL.
+        if (cmd.forceSpiral && ctx->fsm->state() != STATE_GRID_PATROL) {
+            if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                ctx->command.forceSpiral = false;
+                xSemaphoreGive(ctx->stateMutex);
+            }
+            Serial.println(F("[USV] FORCE_SPIRAL refused — need GRID_PATROL"));
+            cmd.forceSpiral = false;
+        }
+
         FsmInputs in;
         memset(&in, 0, sizeof(in));
-        in.startCommand     = cmd.start;
-        in.clearEstop       = cmd.clearEstop;
-        in.emergencyCommand = cmd.emergency;
-        in.forceRthCommand  = cmd.forceRth;
-        in.anomalyDetected  = anomaly;
+        in.startCommand        = cmd.start;
+        in.clearEstop          = cmd.clearEstop;
+        in.emergencyCommand    = cmd.emergency;
+        in.forceRthCommand     = cmd.forceRth;
+        in.forceSpiralCommand  = cmd.forceSpiral;
+        in.anomalyDetected     = anomaly;
         in.spiralComplete   = spiralDone;
         in.gridComplete     = ctx->nav->missionComplete();
+        float distHomeM = NAN;
+        if (g_homeSet && fix.valid) {
+            distHomeM = (float)Navigator::calculateDistance(
+                fix.lat, fix.lon, g_homeLat, g_homeLon);
+            if (distHomeM >= RTH_DEPART_RADIUS_M) {
+                g_homeLeft = true;
+            }
+        }
+        // Arrive only if this RTH started outside the 2 m bubble. GPS wander
+        // can set g_homeLeft while the boat is still on the START fix.
         in.arrivedHome      = g_homeSet && fix.valid &&
-            (Navigator::calculateDistance(fix.lat, fix.lon, g_homeLat, g_homeLon)
-                 <= WAYPOINT_RADIUS_M);
+            isfinite(distHomeM) && isfinite(g_rthEntryDistM) &&
+            (g_rthEntryDistM > RTH_ARRIVE_RADIUS_M) &&
+            (distHomeM <= RTH_ARRIVE_RADIUS_M) &&
+            ((millis() - g_rthEnterMs) >= RTH_MIN_HOLD_MS);
         in.gpsOk            = gpsOk;
         in.gpsFault         = (gpsTier == GpsLossTier::GPS_FAULT);
         in.homeSet          = g_homeSet;
@@ -430,8 +484,13 @@ void navigationTask(void* pv) {
             stateBefore == STATE_STANDBY && safety != SafetyState::NORMAL;
         const bool clearAccepted =
             stateBefore == STATE_EMERGENCY_STOP && state == STATE_STANDBY;
+        const bool forceSpiralAccepted =
+            stateBefore == STATE_GRID_PATROL &&
+            state == STATE_SPIRAL_MAPPING &&
+            cmd.forceSpiral;
         if ((cmd.start && (startAccepted || startUnsafe)) ||
-            (cmd.clearEstop && clearAccepted)) {
+            (cmd.clearEstop && clearAccepted) ||
+            forceSpiralAccepted) {
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 if (cmd.start && (startAccepted || startUnsafe))
                     ctx->command.start = false;
@@ -440,8 +499,13 @@ void navigationTask(void* pv) {
                     // Clear dedicated E-Stop event only after FSM left ESTOP.
                     EspNowLink::clearEmergencyPending();
                 }
+                if (forceSpiralAccepted)
+                    ctx->command.forceSpiral = false;
                 xSemaphoreGive(ctx->stateMutex);
             }
+        }
+        if (forceSpiralAccepted) {
+            Serial.println(F("[USV] FORCE_SPIRAL accepted"));
         }
 
         // On entering E-Stop: clear start/manual/clear so we cannot auto-resume
@@ -450,6 +514,7 @@ void navigationTask(void* pv) {
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 ctx->command.start = false;
                 ctx->command.clearEstop = false;
+                ctx->command.forceSpiral = false;
                 ctx->command.manualMode = false;
                 ctx->command.manualSpeed = 0;
                 ctx->command.manualSteer = 0;
@@ -458,19 +523,40 @@ void navigationTask(void* pv) {
             ctx->heading->reset();
         }
 
-        // Capture home on STANDBY -> GRID_PATROL (every mission).
+        // Mission origin follows START. RTH home is CMD_SET_HOME; START
+        // only fills it if shore never latched a dock fix.
         if (state == STATE_GRID_PATROL && prevState == STATE_STANDBY) {
             if (fix.valid) {
-                g_homeLat = fix.lat;
-                g_homeLon = fix.lon;
-                g_homeSet = true;
+                g_homeLeft = false;
+                g_rthEntryDistM = NAN;
+                g_rthEnterMs = 0;
                 ctx->nav->setMissionOrigin(fix.lat, fix.lon);
+                if (!g_homeSet) {
+                    g_homeLat = fix.lat;
+                    g_homeLon = fix.lon;
+                    g_homeSet = true;
+                    Serial.printf("[USV] home lat=%.6f lon=%.6f (START fallback)\n",
+                                  g_homeLat, g_homeLon);
+                } else {
+                    const float startDist = (float)Navigator::calculateDistance(
+                        fix.lat, fix.lon, g_homeLat, g_homeLon);
+                    Serial.printf("[USV] start dist from home=%.1fm\n", startDist);
+                }
             } else {
                 // Should not happen (FSM requires gpsOk); stop as failsafe.
                 ctx->motor->stop();
             }
             ctx->heading->reset();
             haveLastLosTarget = false;
+        }
+
+        if (state == STATE_RTH && prevState != STATE_RTH) {
+            g_rthEntryDistM = distHomeM;
+            g_rthEnterMs = millis();
+            Serial.printf(
+                "[USV] RTH entry dist=%.1fm left=%u home=%.6f,%.6f now=%.6f,%.6f\n",
+                distHomeM, (unsigned)g_homeLeft,
+                g_homeLat, g_homeLon, fix.lat, fix.lon);
         }
 
         // Mission finished at home.
@@ -630,14 +716,24 @@ void navigationTask(void* pv) {
 
             case STATE_RTH: {
                 if (g_homeSet && navSensorsOk) {
-                    float bearing = (float)Navigator::calculateBearing(
-                        fix.lat, fix.lon, g_homeLat, g_homeLon);
-                    float herr = HeadingController::computeHeadingError(bearing, heading);
-                    float dist = (float)Navigator::calculateDistance(
-                        fix.lat, fix.lon, g_homeLat, g_homeLon);
-                    int base = chooseBasePwm(herr, dist, MOTOR_CRUISE_PWM);
-                    ctx->heading->calculateThrusterOutputs(
-                        bearing, heading, base, dt, leftPwm, rightPwm);
+                    const float dist = isfinite(distHomeM) ? distHomeM :
+                        (float)Navigator::calculateDistance(
+                            fix.lat, fix.lon, g_homeLat, g_homeLon);
+                    // Started RTH already inside 2 m: hold mode 3, do not spin.
+                    if (isfinite(g_rthEntryDistM) &&
+                        g_rthEntryDistM <= RTH_ARRIVE_RADIUS_M &&
+                        dist <= RTH_ARRIVE_RADIUS_M) {
+                        leftPwm = 0;
+                        rightPwm = 0;
+                    } else {
+                        float bearing = (float)Navigator::calculateBearing(
+                            fix.lat, fix.lon, g_homeLat, g_homeLon);
+                        float herr = HeadingController::computeHeadingError(
+                            bearing, heading);
+                        int base = chooseBasePwm(herr, dist, MOTOR_CRUISE_PWM);
+                        ctx->heading->calculateThrusterOutputs(
+                            bearing, heading, base, dt, leftPwm, rightPwm);
+                    }
                 }
                 ctx->motor->writeThrust(leftPwm, rightPwm);
                 break;
@@ -677,6 +773,7 @@ void navigationTask(void* pv) {
             ctx->snapshot.battery_percent = ctx->battery->getBatteryPercent();
             ctx->snapshot.heading_angle   = compassOk ? heading : NAN;
             ctx->batteryVoltage            = battV;
+            ctx->turbVoltage               = ctx->water->lastTurbVoltage();
             ctx->compassAddr               = ctx->compass->i2cAddress();
             ctx->compassFailCount          = ctx->compass->failCount();
             ctx->compassFresh              = ctx->compass->isFresh() ? 1 : 0;
@@ -684,6 +781,8 @@ void navigationTask(void* pv) {
             ctx->compassRawY               = ctx->compass->rawY();
             ctx->compassNvs                = ctx->compass->nvsLoaded() ? 1 : 0;
             ctx->compassCalRun             = ctx->compass->isCalibrating() ? 1 : 0;
+            ctx->homeDistM                 = distHomeM;
+            ctx->homeSetFlag               = g_homeSet ? 1 : 0;
             logRec = ctx->snapshot;
             // SD records have their own monotonic 20 Hz sequence. ESP-NOW
             // sequence remains owned exclusively by ioTask.
@@ -753,12 +852,19 @@ void ioTask(void* pv) {
                     ctx->command.emergency = false;
                     ctx->command.forceRth = false;
                     ctx->command.start = false;
+                    ctx->command.forceSpiral = false;
                     ctx->command.manualMode = false;
                     ctx->command.manualSpeed = 0;
                     ctx->command.manualSteer = 0;
                     break;
                 case CMD_MISSION_UPLOAD_DONE:
                     ctx->command.sealMissionUpload = true;
+                    break;
+                case CMD_SET_HOME:
+                    ctx->command.setHome = true;
+                    break;
+                case CMD_FORCE_SPIRAL:
+                    ctx->command.forceSpiral = true;
                     break;
                 case CMD_NORMAL:
                     ctx->command.forceRth = false;
@@ -857,9 +963,16 @@ void ioTask(void* pv) {
             millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
             lastTelemetry = millis();
             TelemetryPacket tp;
+            float turbV = NAN;
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 tp = ctx->snapshot;
+                turbV = ctx->turbVoltage;
                 xSemaphoreGive(ctx->stateMutex);
+                if (!radioSendsWaterQuality(tp.current_mode)) {
+                    tp.water_ph = NAN;
+                    tp.water_turbidity = NAN;
+                    tp.water_temp = NAN;
+                }
                 const bool ok = ctx->link->sendTelemetry(tp);
                 if (ok) {
                     // Mirror stamped seq back into telemetry snapshot only.
@@ -872,11 +985,12 @@ void ioTask(void* pv) {
 #if RADIO_TRACE
                 Serial.printf(
                     "[TX] TEL %s seq=%lu lat=%.6f lon=%.6f ph=%.2f ntu=%.1f "
-                    "t=%.1f mode=%u batt=%u hdg=%.1f %s\n",
+                    "turbV=%.3f t=%.1f mode=%u batt=%u hdg=%.1f %s\n",
                     ok ? "ok" : "FAIL",
                     (unsigned long)tp.sequence_number,
                     tp.gps_lat, tp.gps_lon,
-                    tp.water_ph, tp.water_turbidity, tp.water_temp,
+                    tp.water_ph, tp.water_turbidity,
+                    turbV, tp.water_temp,
                     (unsigned)tp.current_mode,
                     (unsigned)tp.battery_percent,
                     tp.heading_angle,
@@ -936,6 +1050,7 @@ void ioTask(void* pv) {
 
         if (millis() - lastRadioDiag >= RADIO_DIAG_MS) {
             lastRadioDiag = millis();
+#if RADIO_TRACE
             const uint8_t* peer = EspNowLink::peerMac();
             Serial.printf(
                 "[USV] radio tx=%s rxDrop=%lu (mac=%lu len=%lu cmd=%lu) rxOk=%lu "
@@ -960,6 +1075,8 @@ void ioTask(void* pv) {
             uint8_t cAddr = 0, cFail = 0, cFresh = 0, cNvs = 0, cCal = 0;
             int16_t cX = 0, cY = 0;
             float hdg = NAN;
+            float homeD = NAN;
+            uint8_t homeSet = 0;
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 cAddr  = ctx->compassAddr;
                 cFail  = ctx->compassFailCount;
@@ -969,13 +1086,18 @@ void ioTask(void* pv) {
                 cNvs   = ctx->compassNvs;
                 cCal   = ctx->compassCalRun;
                 hdg    = ctx->snapshot.heading_angle;
+                homeD  = ctx->homeDistM;
+                homeSet = ctx->homeSetFlag;
                 xSemaphoreGive(ctx->stateMutex);
             }
             Serial.printf(
-                "[USV] compass addr=0x%02X fresh=%u fail=%u raw=%d,%d hdg=%.1f cal=%s\n",
+                "[USV] compass addr=0x%02X fresh=%u fail=%u raw=%d,%d hdg=%.1f cal=%s "
+                "homeDist=%.1fm set=%u\n",
                 (unsigned)cAddr, (unsigned)cFresh, (unsigned)cFail,
                 (int)cX, (int)cY, hdg,
-                cCal ? "RUN" : (cNvs ? "NVS" : "FACT"));
+                cCal ? "RUN" : (cNvs ? "NVS" : "FACT"),
+                homeD, (unsigned)homeSet);
+#endif
         }
 
         ctx->wdt->feed();

@@ -61,10 +61,12 @@ static void printPairingBanner(bool commsOk) {
                   commsOk ? "init OK" : "INIT FAIL");
     Serial.println(F("[USV] keys PMK=USV_PMK_16bytes! LMK=USV_LMK_16bytes! encrypt=1 LR=1 PS=NONE"));
     Serial.println(F("[USV] gateway must match: Packets.h sizes 5/194/38/2/20/12"));
-    Serial.println(F("[USV] CMD 0=NORMAL 1=ESTOP 2=RTH 3=START_ARM 4=CLEAR_ESTOP 5=UPLOAD_DONE"));
+    Serial.println(F("[USV] CMD 0=NORMAL 1=ESTOP 2=RTH 3=START_ARM 4=CLEAR_ESTOP 5=UPLOAD_DONE 6=SET_HOME 7=FORCE_SPIRAL"));
     Serial.println(F("[USV] indoor: no GPS => STANDBY + motors stopped. Pass = telemetry ~1 Hz"));
     Serial.println(F("[USV] BOOT (not RST) in STANDBY = CALMAG; press again to save"));
     Serial.println(F("[USV] click this monitor, press any key to pause/resume TEL (not C = CALMAG)"));
+    Serial.println(F("[USV] turb: TEL turbV= ADS A1 volts; NTU valid only if turbV>=2.50"));
+    Serial.println(F("[USV] turb trim: blue pot on analog board, ~4.1V in air/clear water"));
 #if RADIO_TRACE
     Serial.println(F("[USV] radio trace [TX]/[RX] on this Serial — compare with gateway"));
 #endif
@@ -80,6 +82,9 @@ static void haltFatal(const char* msg) {
 
 void setup() {
     Serial.begin(115200);
+    // Do not send ESP-IDF WiFi/ESP-NOW logs to UART. CORE_DEBUG_LEVEL=3 used
+    // to stall core 0 when the USB-UART chip is unpowered (battery / BEC 5V).
+    Serial.setDebugOutput(false);
     delay(200);
     Serial.println(F("[USV] boot"));
     pinMode(COMPASS_CAL_BUTTON_PIN, INPUT_PULLUP);
@@ -107,6 +112,8 @@ void setup() {
         Serial.printf("[USV] compass hard-iron %s x=[%.0f,%.0f] y=[%.0f,%.0f]\n",
                       compass.nvsLoaded() ? "NVS" : "factory",
                       xMin, xMax, yMin, yMax);
+        Serial.printf("[USV] compass yaw offset=%.1f deg mirror=%d (bow north ~0)\n",
+                      (double)COMPASS_YAW_OFFSET_DEG, (int)COMPASS_YAW_MIRROR);
     } else {
         Serial.println(F("[USV] compass FAIL — need QMC5883P@0x2C chipID 0x80"));
         printI2cScan();
@@ -147,6 +154,9 @@ void setup() {
     ctx.wdt = &watchdog;
     ctx.safety = &safety; ctx.fsm = &fsm;
     ctx.batteryVoltage = VOLTAGE_FULL;
+    ctx.turbVoltage = NAN;
+    ctx.homeDistM = NAN;
+    ctx.homeSetFlag = 0;
     ctx.logDropCount = 0;
     ctx.ackDropCount = 0;
     ctx.stageDropCount = 0;

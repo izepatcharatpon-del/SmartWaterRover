@@ -21,7 +21,8 @@ WaterSensors::WaterSensors()
       _tempValid(false),
       _adsReady(false),
       _vCap401(NAN), _vCap686(NAN), _vCap918(NAN),
-      _cap401(false), _cap686(false), _cap918(false) {
+      _cap401(false), _cap686(false), _cap918(false),
+      _lastTurbVoltage(NAN) {
     resetCalibration();
 }
 
@@ -229,10 +230,19 @@ WaterReading WaterSensors::readPh(float tempC) {
 
 WaterReading WaterSensors::readTurbidityNtu() {
     WaterReading r = {0.0f, false};
-    float voltage = 0.0f;
-    if (!readChannelVoltage(ADS_TURB_CHANNEL, voltage)) return r;
+    _lastTurbVoltage = NAN;
+    if (!_adsReady) return r;
 
+    // Keep raw volts even below TURBIDITY_FAULT_V so Serial can show trim/open-wire.
+    const int16_t raw = _ads.readADC_SingleEnded(ADS_TURB_CHANNEL);
+    const float voltage = _ads.computeVolts(raw);
+    _lastTurbVoltage = voltage;
+    if (!isfinite(voltage) || voltage < 0.01f || voltage > 5.25f) return r;
     if (voltage < TURBIDITY_FAULT_V) return r;
+#if !TURBIDITY_OPTICS_OK
+    // Voltage is logged via lastTurbVoltage(); do not publish NTU or arm spiral.
+    return r;
+#endif
 
     float ntu;
     if (voltage > TURBIDITY_CLEAR_V) ntu = 0.0f;
