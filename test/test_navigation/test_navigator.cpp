@@ -367,6 +367,11 @@ void test_spiral_accept_radius_below_inner_chord(void) {
     TEST_ASSERT_TRUE(chord > SPIRAL_WAYPOINT_RADIUS_M * 1.5f);
 }
 
+void test_spiral_first_ring_outside_accept(void) {
+    // Sitting on the center must not already "hit" the first point.
+    TEST_ASSERT_TRUE(SPIRAL_A_M > SPIRAL_WAYPOINT_RADIUS_M);
+}
+
 void test_spiral_reaches_three_turns_inside_radius(void) {
     SpiralPlanner sp;
     sp.begin(13.75, 100.50);
@@ -379,8 +384,7 @@ void test_spiral_reaches_three_turns_inside_radius(void) {
         count++;
         TEST_ASSERT_TRUE(count < 1000); // safety
     }
-    // With b≈0.69 and dtheta≈0.52, ~36 points for 3 turns.
-    TEST_ASSERT_TRUE(count >= 30);
+    TEST_ASSERT_TRUE(count >= 20);
     TEST_ASSERT_TRUE(maxR <= SPIRAL_MAX_RADIUS_M + 0.5);
     TEST_ASSERT_TRUE(maxR > SPIRAL_MAX_RADIUS_M - 0.2);
 }
@@ -560,6 +564,35 @@ void test_stage_reporter_edge_filter_ignores_readiness_chatter(void) {
     TEST_ASSERT_FALSE(StageReporter::sameStatus(a, b));
 }
 
+void test_rth_depart_needs_dwell_not_one_spike(void) {
+    uint32_t accum = 0;
+    TEST_ASSERT_FALSE(MissionFsm::latchDeparted(false, 20.0f, accum, 50));
+    TEST_ASSERT_FALSE(MissionFsm::latchDeparted(false, 1.0f, accum, 50));
+    TEST_ASSERT_EQUAL_UINT32(0, accum);
+
+    TEST_ASSERT_FALSE(MissionFsm::latchDeparted(false, 20.0f, accum, 1000));
+    TEST_ASSERT_TRUE(MissionFsm::latchDeparted(false, 20.0f, accum, 1000));
+    TEST_ASSERT_TRUE(MissionFsm::latchDeparted(true, 1.0f, accum, 50));
+}
+
+void test_rth_arrive_rejected_if_never_left_or_started_inside(void) {
+    uint32_t inside = 0;
+    TEST_ASSERT_FALSE(MissionFsm::isArrivedHome(
+        true, true, false, 0.5f, 4.0f, inside, 4000));
+    inside = 0;
+    TEST_ASSERT_FALSE(MissionFsm::isArrivedHome(
+        true, true, true, 0.5f, 0.5f, inside, 4000));
+    inside = 0;
+    TEST_ASSERT_FALSE(MissionFsm::isArrivedHome(
+        true, true, true, 0.5f, 15.0f, inside, 1000));
+    TEST_ASSERT_TRUE(MissionFsm::isArrivedHome(
+        true, true, true, 0.5f, 15.0f, inside, 2000));
+    inside = 4000;
+    TEST_ASSERT_FALSE(MissionFsm::isArrivedHome(
+        true, true, true, 1.5f, 15.0f, inside, 50));
+    TEST_ASSERT_EQUAL_UINT32(0, inside);
+}
+
 void test_fsm_rth_arrives_home_despite_low_battery(void) {
     MissionFsm fsm;
     fsm.begin();
@@ -610,6 +643,19 @@ void test_fsm_clear_ignored_outside_estop(void) {
     in.startCommand = false;
     in.clearEstop = true;  // CLEAR while GRID must not change state by itself
     TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+}
+
+void test_fsm_grid_complete_without_home_is_standby(void) {
+    MissionFsm fsm;
+    fsm.begin();
+    FsmInputs in = baseInputs();
+    in.homeSet = false;
+    in.startCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.startCommand = false;
+
+    in.gridComplete = true;
+    TEST_ASSERT_EQUAL(STATE_STANDBY, fsm.tick(in));
 }
 
 void test_fsm_force_rth_without_home_is_estop(void) {
@@ -727,6 +773,7 @@ int main(int, char**) {
     RUN_TEST(test_spiral_offset_grows);
     RUN_TEST(test_spiral_offset_wraps_longitude);
     RUN_TEST(test_spiral_accept_radius_below_inner_chord);
+    RUN_TEST(test_spiral_first_ring_outside_accept);
     RUN_TEST(test_spiral_reaches_three_turns_inside_radius);
     RUN_TEST(test_pid_angular_wrap_no_spike);
     RUN_TEST(test_pid_reset_clears_integral);
@@ -735,9 +782,12 @@ int main(int, char**) {
     RUN_TEST(test_stage_reporter_start_waits_for_nav_ready);
     RUN_TEST(test_stage_reporter_transition_reasons);
     RUN_TEST(test_stage_reporter_edge_filter_ignores_readiness_chatter);
+    RUN_TEST(test_rth_depart_needs_dwell_not_one_spike);
+    RUN_TEST(test_rth_arrive_rejected_if_never_left_or_started_inside);
     RUN_TEST(test_fsm_rth_arrives_home_despite_low_battery);
     RUN_TEST(test_fsm_estop_requires_clear);
     RUN_TEST(test_fsm_clear_ignored_outside_estop);
+    RUN_TEST(test_fsm_grid_complete_without_home_is_standby);
     RUN_TEST(test_fsm_force_rth_without_home_is_estop);
     RUN_TEST(test_fsm_start_needs_waypoints);
     RUN_TEST(test_fsm_force_spiral_from_grid);

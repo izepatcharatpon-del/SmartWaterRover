@@ -38,6 +38,14 @@ public:
     BoatState tick(const FsmInputs& in);
     BoatState state() const { return _state; }
 
+    // Latch "left home" only after a dwell outside RTH_DEPART — one GPS spike must not count.
+    static bool latchDeparted(bool alreadyLeft, float distHomeM,
+                              uint32_t& outsideAccumMs, uint32_t dtMs);
+    // True only after a dwell inside RTH_ARRIVE of the stored SET_HOME fix.
+    static bool isArrivedHome(bool homeSet, bool fixValid, bool departed,
+                              float distHomeM, float rthEntryDistM,
+                              uint32_t& insideAccumMs, uint32_t dtMs);
+
 private:
     BoatState _state;
 };

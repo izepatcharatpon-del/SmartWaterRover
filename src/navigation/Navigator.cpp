@@ -214,9 +214,11 @@ void Navigator::advanceWaypoint() {
     if (_index < _count) _index++;
 }
 
-LosGuidance Navigator::computeLos(double lat, double lon,
-                                  double lookaheadM, double radiusM,
-                                  double passMarginM) const {
+LosGuidance Navigator::computeSegmentLos(double lat, double lon,
+                                         const Waypoint& start,
+                                         const Waypoint& end,
+                                         double lookaheadM, double radiusM,
+                                         double passMarginM) {
     LosGuidance g;
     g.bearingDeg = 0.0f;
     g.crossTrackM = 0.0f;
@@ -226,11 +228,6 @@ LosGuidance Navigator::computeLos(double lat, double lon,
     g.reached = false;
     g.passed = false;
     g.valid = false;
-
-    if (_index >= _count) return g;
-
-    Waypoint end = _wps[_index];
-    Waypoint start = segmentStart();
 
     g.distToEndM = (float)calculateDistance(lat, lon, end.lat, end.lon);
     g.reached = (g.distToEndM <= (float)radiusM);
@@ -274,4 +271,22 @@ LosGuidance Navigator::computeLos(double lat, double lon,
     g.lookAheadDistM = (float)calculateDistance(lat, lon, laLat, laLon);
     g.valid = true;
     return g;
+}
+
+LosGuidance Navigator::computeLos(double lat, double lon,
+                                  double lookaheadM, double radiusM,
+                                  double passMarginM) const {
+    LosGuidance g;
+    g.bearingDeg = 0.0f;
+    g.crossTrackM = 0.0f;
+    g.alongTrackM = 0.0f;
+    g.distToEndM = 0.0f;
+    g.lookAheadDistM = 0.0f;
+    g.reached = false;
+    g.passed = false;
+    g.valid = false;
+
+    if (_index >= _count) return g;
+    return computeSegmentLos(lat, lon, segmentStart(), _wps[_index],
+                             lookaheadM, radiusM, passMarginM);
 }

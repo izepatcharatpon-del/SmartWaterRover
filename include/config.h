@@ -73,22 +73,25 @@
 #define HEADING_KD             0.80f
 #define PID_DERIV_ALPHA        0.30f
 #define WAYPOINT_RADIUS_M      2.5f
-#define LOS_LOOKAHEAD_M        2.5f
+#define LOS_LOOKAHEAD_M        2.0f   // shorter than 2.5 m → less corner cut
 #define LOS_PASS_MARGIN_M      0.5f
 #define LOS_NEAR_SLOW_M        5.0f
-#define LOS_TURN_FIRST_DEG     35.0f
+#define LOS_TURN_FIRST_DEG     25.0f  // in-place sooner; 35° still carved a wide arc
 #define RTH_DEPART_RADIUS_M    12.0f
-#define RTH_ARRIVE_RADIUS_M    2.0f
-#define RTH_MIN_HOLD_MS        3000UL
+#define RTH_ARRIVE_RADIUS_M    1.0f   // park on stored SET_HOME; GPS cannot hit 0 m
+#define RTH_MIN_HOLD_MS        3000UL // must stay inside arrive radius this long
+#define RTH_DEPART_DWELL_MS    2000UL
 #define HEADING_STOP_TOL_DEG   3.0f
 #define MANUAL_CMD_TIMEOUT_MS  500UL
 
-#define SPIRAL_A_M             2.0f
-#define SPIRAL_B_M             0.6897f
+// Pond GPS cannot hit a 0.45 m ball: the boat orbited each vertex (ellipse).
+// First ring and chord must stay outside SPIRAL_WAYPOINT_RADIUS_M.
+#define SPIRAL_A_M             5.0f
 #define SPIRAL_MAX_RADIUS_M    15.0f
-#define SPIRAL_MAX_THETA       (6.0f * 3.14159265f)
-#define SPIRAL_DTHETA          0.5236f
-#define SPIRAL_WAYPOINT_RADIUS_M 0.45f
+#define SPIRAL_MAX_THETA       (6.0f * 3.14159265f)   // 3 turns
+#define SPIRAL_B_M             ((SPIRAL_MAX_RADIUS_M - SPIRAL_A_M) / SPIRAL_MAX_THETA)
+#define SPIRAL_DTHETA          (3.14159265f / 4.0f)   // 45°; inner chord ~3.8 m
+#define SPIRAL_WAYPOINT_RADIUS_M 2.0f                 // same family as RTH arrive
 
 #define PH_BUF_401             4.01f
 #define PH_BUF_686             6.86f

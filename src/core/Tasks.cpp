@@ -7,10 +7,13 @@
 static double g_homeLat = 0.0, g_homeLon = 0.0;
 static bool   g_homeSet = false;
 static bool   g_homeLeft = false;
+static uint32_t g_homeOutsideAccumMs = 0;
 static float    g_rthEntryDistM = NAN;
 static uint32_t g_rthEnterMs = 0;
+static uint32_t g_rthInsideAccumMs = 0;
 
 static Waypoint g_spiralTgt = {0.0, 0.0};
+static Waypoint g_spiralStart = {0.0, 0.0};
 static bool     g_haveSpiralTgt = false;
 static bool     g_spiralInitialized = false;
 
@@ -390,6 +393,7 @@ void navigationTask(void* pv) {
                 g_homeLon = fix.lon;
                 g_homeSet = true;
                 g_homeLeft = false;
+                g_homeOutsideAccumMs = 0;
                 Serial.printf("[USV] SET_HOME lat=%.6f lon=%.6f\n",
                               g_homeLat, g_homeLon);
             } else {
@@ -420,15 +424,19 @@ void navigationTask(void* pv) {
         if (g_homeSet && fix.valid) {
             distHomeM = (float)Navigator::calculateDistance(
                 fix.lat, fix.lon, g_homeLat, g_homeLon);
-            if (distHomeM >= RTH_DEPART_RADIUS_M) {
-                g_homeLeft = true;
-            }
+            g_homeLeft = MissionFsm::latchDeparted(
+                g_homeLeft, distHomeM, g_homeOutsideAccumMs, NAV_LOOP_PERIOD_MS);
+        } else {
+            g_homeOutsideAccumMs = 0;
         }
-        in.arrivedHome      = g_homeSet && fix.valid &&
-            isfinite(distHomeM) && isfinite(g_rthEntryDistM) &&
-            (g_rthEntryDistM > RTH_ARRIVE_RADIUS_M) &&
-            (distHomeM <= RTH_ARRIVE_RADIUS_M) &&
-            ((millis() - g_rthEnterMs) >= RTH_MIN_HOLD_MS);
+        in.arrivedHome = false;
+        if (ctx->fsm->state() == STATE_RTH) {
+            in.arrivedHome = MissionFsm::isArrivedHome(
+                g_homeSet, fix.valid, g_homeLeft,
+                distHomeM, g_rthEntryDistM, g_rthInsideAccumMs, NAV_LOOP_PERIOD_MS);
+        } else {
+            g_rthInsideAccumMs = 0;
+        }
         in.gpsOk            = gpsOk;
         in.gpsFault         = (gpsTier == GpsLossTier::GPS_FAULT);
         in.homeSet          = g_homeSet;
@@ -484,19 +492,17 @@ void navigationTask(void* pv) {
         if (state == STATE_GRID_PATROL && prevState == STATE_STANDBY) {
             if (fix.valid) {
                 g_homeLeft = false;
+                g_homeOutsideAccumMs = 0;
                 g_rthEntryDistM = NAN;
                 g_rthEnterMs = 0;
+                g_rthInsideAccumMs = 0;
                 ctx->nav->setMissionOrigin(fix.lat, fix.lon);
-                if (!g_homeSet) {
-                    g_homeLat = fix.lat;
-                    g_homeLon = fix.lon;
-                    g_homeSet = true;
-                    Serial.printf("[USV] home lat=%.6f lon=%.6f (START fallback)\n",
-                                  g_homeLat, g_homeLon);
-                } else {
+                if (g_homeSet) {
                     const float startDist = (float)Navigator::calculateDistance(
                         fix.lat, fix.lon, g_homeLat, g_homeLon);
                     Serial.printf("[USV] start dist from home=%.1fm\n", startDist);
+                } else {
+                    Serial.println(F("[USV] no home — SET_HOME before RTH"));
                 }
             } else {
                 ctx->motor->stop();
@@ -508,8 +514,9 @@ void navigationTask(void* pv) {
         if (state == STATE_RTH && prevState != STATE_RTH) {
             g_rthEntryDistM = distHomeM;
             g_rthEnterMs = millis();
+            g_rthInsideAccumMs = 0;
             Serial.printf(
-                "[USV] RTH entry dist=%.1fm left=%u home=%.6f,%.6f now=%.6f,%.6f\n",
+                "[USV] RTH to SET_HOME dist=%.1fm left=%u home=%.6f,%.6f now=%.6f,%.6f\n",
                 distHomeM, (unsigned)g_homeLeft,
                 g_homeLat, g_homeLon, fix.lat, fix.lon);
         }
@@ -625,6 +632,8 @@ void navigationTask(void* pv) {
                 if (!g_spiralInitialized) {
                     if (fix.valid) {
                         ctx->spiralPlanner->begin(fix.lat, fix.lon);
+                        g_spiralStart.lat = fix.lat;
+                        g_spiralStart.lon = fix.lon;
                         g_spiralInitialized = true;
                         g_haveSpiralTgt = false;
                     } else {
@@ -633,10 +642,7 @@ void navigationTask(void* pv) {
                     }
                 }
 
-                if (g_spiralInitialized &&
-                    (!g_haveSpiralTgt || (fix.valid &&
-                        Navigator::calculateDistance(fix.lat, fix.lon,
-                            g_spiralTgt.lat, g_spiralTgt.lon) <= SPIRAL_WAYPOINT_RADIUS_M))) {
+                if (g_spiralInitialized && !g_haveSpiralTgt) {
                     g_haveSpiralTgt = ctx->spiralPlanner->nextSpiralPoint(g_spiralTgt);
                     if (!g_haveSpiralTgt) {
                         spiralDone = true;
@@ -646,14 +652,38 @@ void navigationTask(void* pv) {
                 }
 
                 if (g_haveSpiralTgt && navSensorsOk) {
-                    float bearing = (float)Navigator::calculateBearing(
-                        fix.lat, fix.lon, g_spiralTgt.lat, g_spiralTgt.lon);
-                    float herr = HeadingController::computeHeadingError(bearing, heading);
-                    float dist = (float)Navigator::calculateDistance(
-                        fix.lat, fix.lon, g_spiralTgt.lat, g_spiralTgt.lon);
-                    int base = chooseBasePwm(herr, dist, MOTOR_MIN_PWM + 30);
-                    ctx->heading->calculateThrusterOutputs(
-                        bearing, heading, base, dt, leftPwm, rightPwm);
+                    LosGuidance los = Navigator::computeSegmentLos(
+                        fix.lat, fix.lon, g_spiralStart, g_spiralTgt,
+                        LOS_LOOKAHEAD_M, SPIRAL_WAYPOINT_RADIUS_M,
+                        LOS_PASS_MARGIN_M);
+
+                    const bool reachedWithProgress =
+                        los.reached && (los.alongTrackM >= 0.5f);
+                    if (los.valid && (reachedWithProgress || los.passed)) {
+                        g_spiralStart = g_spiralTgt;
+                        g_haveSpiralTgt = ctx->spiralPlanner->nextSpiralPoint(g_spiralTgt);
+                        ctx->heading->reset();
+                        haveLastLosTarget = false;
+                        Serial.printf("[USV] spiral hit d=%.1fm along=%.1f\n",
+                                      los.distToEndM, los.alongTrackM);
+                        if (!g_haveSpiralTgt) {
+                            spiralDone = true;
+                        } else {
+                            los = Navigator::computeSegmentLos(
+                                fix.lat, fix.lon, g_spiralStart, g_spiralTgt,
+                                LOS_LOOKAHEAD_M, SPIRAL_WAYPOINT_RADIUS_M,
+                                LOS_PASS_MARGIN_M);
+                        }
+                    }
+
+                    if (g_haveSpiralTgt && los.valid) {
+                        float herr = HeadingController::computeHeadingError(
+                            los.bearingDeg, heading);
+                        int base = chooseBasePwm(
+                            herr, los.distToEndM, MOTOR_APPROACH_PWM);
+                        ctx->heading->calculateThrusterOutputs(
+                            los.bearingDeg, heading, base, dt, leftPwm, rightPwm);
+                    }
                 }
                 ctx->motor->writeThrust(leftPwm, rightPwm);
                 break;
@@ -664,9 +694,9 @@ void navigationTask(void* pv) {
                     const float dist = isfinite(distHomeM) ? distHomeM :
                         (float)Navigator::calculateDistance(
                             fix.lat, fix.lon, g_homeLat, g_homeLon);
-                    if (isfinite(g_rthEntryDistM) &&
-                        g_rthEntryDistM <= RTH_ARRIVE_RADIUS_M &&
-                        dist <= RTH_ARRIVE_RADIUS_M) {
+                    // Park on the stored SET_HOME fix. Keep thrusting through
+                    // the bubble and the boat overshoots the dock GPS.
+                    if (dist <= RTH_ARRIVE_RADIUS_M) {
                         leftPwm = 0;
                         rightPwm = 0;
                     } else {

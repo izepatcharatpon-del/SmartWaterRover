@@ -63,6 +63,13 @@ public:
                            double lookaheadM, double radiusM,
                            double passMarginM) const;
 
+    // Same LOS as computeLos, for a segment that is not the grid list.
+    static LosGuidance computeSegmentLos(double lat, double lon,
+                                         const Waypoint& start,
+                                         const Waypoint& end,
+                                         double lookaheadM, double radiusM,
+                                         double passMarginM);
+
 private:
     Waypoint _wps[MAX_WAYPOINTS];
     int      _count;

@@ -1,6 +1,45 @@
 #include "MissionFsm.h"
+#include "config.h"
+#include <math.h>
 
 MissionFsm::MissionFsm() : _state(STATE_STANDBY) {}
+
+bool MissionFsm::latchDeparted(bool alreadyLeft, float distHomeM,
+                               uint32_t& outsideAccumMs, uint32_t dtMs) {
+    if (alreadyLeft) {
+        return true;
+    }
+    if (!isfinite(distHomeM) || distHomeM < RTH_DEPART_RADIUS_M) {
+        outsideAccumMs = 0;
+        return false;
+    }
+    outsideAccumMs += dtMs;
+    return outsideAccumMs >= RTH_DEPART_DWELL_MS;
+}
+
+bool MissionFsm::isArrivedHome(bool homeSet, bool fixValid, bool departed,
+                               float distHomeM, float rthEntryDistM,
+                               uint32_t& insideAccumMs, uint32_t dtMs) {
+    if (!homeSet || !fixValid || !departed) {
+        insideAccumMs = 0;
+        return false;
+    }
+    if (!isfinite(distHomeM) || !isfinite(rthEntryDistM)) {
+        insideAccumMs = 0;
+        return false;
+    }
+    // Do not finish an RTH that started on the SET_HOME GPS fix.
+    if (rthEntryDistM <= RTH_ARRIVE_RADIUS_M) {
+        insideAccumMs = 0;
+        return false;
+    }
+    if (distHomeM > RTH_ARRIVE_RADIUS_M) {
+        insideAccumMs = 0;
+        return false;
+    }
+    insideAccumMs += dtMs;
+    return insideAccumMs >= RTH_MIN_HOLD_MS;
+}
 
 void MissionFsm::begin() { _state = STATE_STANDBY; }
 
