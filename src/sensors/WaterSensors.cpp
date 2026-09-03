@@ -7,6 +7,11 @@ static const int   TEMP_CONVERSION_MS = 750;
 static const uint8_t ADS_PH_CHANNEL   = 0;  // A0 pH
 static const uint8_t ADS_TURB_CHANNEL = 1;  // A1 turbidity
 
+static_assert(TURBIDITY_CLEAR_V > TURBIDITY_DIRTY_V,
+              "clear voltage must be higher than dirty");
+static_assert(TURBIDITY_DIRTY_V > TURBIDITY_FAULT_V,
+              "dirty voltage must stay above the open-wire floor");
+
 static const char* PH_NVS_NS    = "usv_ph";
 static const char* PH_NVS_V401  = "v401";
 static const char* PH_NVS_V686  = "v686";
@@ -245,9 +250,10 @@ WaterReading WaterSensors::readTurbidityNtu() {
 #endif
 
     float ntu;
-    if (voltage > TURBIDITY_CLEAR_V) ntu = 0.0f;
+    if (voltage >= TURBIDITY_CLEAR_V) ntu = 0.0f;
     else {
-        ntu = TURBIDITY_A * (voltage * voltage) + TURBIDITY_B * voltage + TURBIDITY_C;
+        ntu = TURBIDITY_DIRTY_NTU * (TURBIDITY_CLEAR_V - voltage) /
+              (TURBIDITY_CLEAR_V - TURBIDITY_DIRTY_V);
         ntu = ntu * TURBIDITY_NTU_SCALE + TURBIDITY_NTU_OFFSET;
         if (ntu < 0.0f) ntu = 0.0f;
     }

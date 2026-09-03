@@ -64,8 +64,7 @@ static void printPairingBanner(bool commsOk) {
     Serial.println(F("[USV] indoor: no GPS => STANDBY + motors stopped. Pass = telemetry ~1 Hz"));
     Serial.println(F("[USV] BOOT (not RST) in STANDBY = CALMAG; press again to save"));
     Serial.println(F("[USV] click this monitor, press any key to pause/resume TEL (not C = CALMAG)"));
-    Serial.println(F("[USV] turb: TEL turbV= ADS A1 volts; NTU valid only if turbV>=2.50"));
-    Serial.println(F("[USV] turb trim: blue pot on analog board, ~4.1V in air/clear water"));
+    Serial.println(F("[USV] turb: A1 from module pin A; NTU if turbV>=0.50 (clear~1.86 dirty~1.20)"));
 #if RADIO_TRACE
     Serial.println(F("[USV] radio trace [TX]/[RX] on this Serial — compare with gateway"));
 #endif

@@ -102,15 +102,15 @@
 #define PH_NEUTRAL_VOLTAGE_V   PH_CAL_V686
 #define PH_SLOPE_25C_V         0.05916f
 #define PH_SLOPE_SCALE         1.00f
-#define TURBIDITY_A            (-1120.4f)
-#define TURBIDITY_B            (5742.3f)
-#define TURBIDITY_C            (-4353.8f)
-#define TURBIDITY_CLEAR_V      4.20f
-#define TURBIDITY_FAULT_V      2.50f
+// Bench 2026-09-03 dip series (LM393 A → ADS A1). Not SEN0189 4.1 V.
+// dry 1.569 | clear 1.855 | mild 1.764 | step-2 discarded (1.782 clearer) | very turbid 1.20
+#define TURBIDITY_CLEAR_V      1.86f
+#define TURBIDITY_DIRTY_V      1.20f
+#define TURBIDITY_DIRTY_NTU    80.0f
+#define TURBIDITY_FAULT_V      0.50f
 #define TURBIDITY_NTU_SCALE    1.00f
 #define TURBIDITY_NTU_OFFSET   0.00f
-// 0 until a new optical probe is fitted — old analog sat at ~3.7 V dry or wet.
-#define TURBIDITY_OPTICS_OK    0
+#define TURBIDITY_OPTICS_OK    1
 
 #define ANOMALY_CLEAR_HYST_NTU 10.0f
 #define ANOMALY_COOLDOWN_MS    45000UL

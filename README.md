@@ -43,7 +43,7 @@ One **3S LiPo** feeds the board (through a buck/BEC) and both motor drivers. USB
 | QMC5883P | Magnetic heading | I2C 0x2C, SDA 8 / SCL 9 |
 | ADS1115 | pH and turbidity voltages | I2C 0x48, A0 = pH, A1 = turbidity |
 | pH probe + analog front-end | pH | Calibrated at 4.01 / 6.86 / 9.18 |
-| Optical turbidity probe | NTU | Currently gated off (`TURBIDITY_OPTICS_OK = 0`) — the old analog head sat near 3.7 V wet or dry |
+| Optical turbidity probe | NTU | LM393 analog `A` → ADS A1; linear map clear 1.86 V / very turbid 1.20 V (`TURBIDITY_OPTICS_OK = 1`) |
 | DS18B20 | Water temperature | 1-Wire on GPIO18 |
 | AA118 5:1 divider | Pack voltage | ADC GPIO4 |
 | 2× BTS7960 | Left / right thrusters | Left RPWM/LPWM = 5/6, right = 40/41. R_EN and L_EN tied HIGH, not driven from GPIO |
