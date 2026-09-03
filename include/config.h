@@ -120,7 +120,8 @@
 #define ANOMALY_DISTURBANCE_MS     3000UL
 #define TURBIDITY_WARNING_NTU  25.0f
 #define TURBIDITY_WASTEWATER_NTU 50.0f
-#define TURBIDITY_ROC_LIMIT    15.0f
+// 15 was SEN0189-scale; this head wobbles ~4 NTU in 2 s (~120/min) while held in sludge.
+#define TURBIDITY_ROC_LIMIT    200.0f
 #define PH_LOW_LIMIT           6.0f
 #define PH_HIGH_LIMIT_DAY      9.2f
 #define PH_HIGH_LIMIT_NIGHT    8.8f
