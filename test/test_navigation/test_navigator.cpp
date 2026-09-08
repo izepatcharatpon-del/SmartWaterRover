@@ -787,7 +787,8 @@ void test_sustained_acid_ph_triggers_after_dwell(void) {
     WaterAnomalyMonitor m;
     uint32_t t = 0;
     // Cold-start pH 5.0 is plausible. Dwell starts on first out-of-range SMA.
-    TEST_ASSERT_FALSE(feedAnomaly(m, 5.0f, 4.0f, t, 16));
+    const int nHold = (int)(PH_ANOMALY_DWELL_MS / 250U);
+    TEST_ASSERT_FALSE(feedAnomaly(m, 5.0f, 4.0f, t, nHold));
     TEST_ASSERT_FALSE(m.shouldTriggerSpiral());
     TEST_ASSERT_TRUE(feedAnomaly(m, 5.0f, 4.0f, t, 2));
     TEST_ASSERT_TRUE(m.shouldTriggerSpiral());
@@ -796,7 +797,8 @@ void test_sustained_acid_ph_triggers_after_dwell(void) {
 void test_sustained_high_ph_day_triggers_after_dwell(void) {
     WaterAnomalyMonitor m;
     uint32_t t = 0;
-    TEST_ASSERT_FALSE(feedAnomaly(m, 9.6f, 4.0f, t, 16, 250, 14));
+    const int nHold = (int)(PH_ANOMALY_DWELL_MS / 250U);
+    TEST_ASSERT_FALSE(feedAnomaly(m, 9.6f, 4.0f, t, nHold, 250, 14));
     TEST_ASSERT_TRUE(feedAnomaly(m, 9.6f, 4.0f, t, 2, 250, 14));
 }
 
@@ -831,7 +833,8 @@ void test_confirmed_plume_jump_can_still_trigger(void) {
     TEST_ASSERT_FALSE(feedAnomaly(m, 7.8f, 4.0f, t, 16));
     // Real step: three agreeing 5.0 samples pass the glitch gate, then dwell.
     TEST_ASSERT_FALSE(feedAnomaly(m, 5.0f, 4.0f, t, PH_GLITCH_CONFIRM_SAMPLES + 8));
-    TEST_ASSERT_TRUE(feedAnomaly(m, 5.0f, 4.0f, t, 20));
+    TEST_ASSERT_TRUE(feedAnomaly(m, 5.0f, 4.0f, t,
+                                (int)(PH_ANOMALY_DWELL_MS / 250U) + 8));
 }
 
 void test_fsm_gps_fault_latches_estop(void) {
