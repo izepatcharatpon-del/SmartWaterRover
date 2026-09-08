@@ -124,6 +124,12 @@
 #define PH_LOW_LIMIT           6.0f
 #define PH_HIGH_LIMIT_DAY      9.2f
 #define PH_HIGH_LIMIT_NIGHT    8.8f
+// Reject electrode dropouts (logged 0–2) and require a dwell before phOut.
+#define PH_PLAUSIBLE_MIN       2.5f
+#define PH_PLAUSIBLE_MAX       12.0f
+#define PH_GLITCH_MAX_STEP     1.0f
+#define PH_GLITCH_CONFIRM_SAMPLES 3
+#define PH_ANOMALY_DWELL_MS    4000UL
 
 #define VOLTAGE_FULL           12.6f
 #define VOLTAGE_RTH            10.5f

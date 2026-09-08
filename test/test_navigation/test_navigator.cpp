@@ -1,4 +1,4 @@
-// Native unit tests: Navigator LOS, FSM, PID, Safety, Spiral
+// Native unit tests: Navigator LOS, FSM, PID, Safety, Spiral, anomaly pH
 // Run: pio test -e native
 #include <unity.h>
 #include <math.h>
@@ -10,6 +10,8 @@
 #include "core/MissionFsm.h"
 #include "core/StageReporter.h"
 #include "safety/SafetyManager.h"
+#include "detection/WaterAnomalyMonitor.h"
+#include "PhPolicy.h"
 #include "config.h"
 
 void setUp(void) {}
@@ -729,6 +731,109 @@ void test_fsm_start_blocked_on_low_battery(void) {
     TEST_ASSERT_EQUAL(STATE_STANDBY, fsm.tick(in));
 }
 
+// ---------------------------------------------------------------------------
+// Water anomaly / phantom pH
+// ---------------------------------------------------------------------------
+static bool feedAnomaly(WaterAnomalyMonitor& m, float ph, float turb,
+                        uint32_t& t, int n, uint32_t dt = 250,
+                        int hour = 14, bool motion = false) {
+    bool any = false;
+    for (int i = 0; i < n; i++) {
+        t += dt;
+        if (m.updateReadings(ph, turb, 32.0f, true, hour, motion, t))
+            any = true;
+    }
+    return any;
+}
+
+void test_ph_policy_rejects_dropout_band(void) {
+    TEST_ASSERT_FALSE(usvPhPlausible(0.0f));
+    TEST_ASSERT_FALSE(usvPhPlausible(2.0f));
+    TEST_ASSERT_FALSE(usvPhPlausible(NAN));
+    TEST_ASSERT_FALSE(usvPhPlausible(12.1f));
+    TEST_ASSERT_TRUE(usvPhPlausible(PH_PLAUSIBLE_MIN));
+    TEST_ASSERT_TRUE(usvPhPlausible(5.0f));
+    TEST_ASSERT_TRUE(usvPhPlausible(7.8f));
+    TEST_ASSERT_TRUE(usvPhPlausible(PH_PLAUSIBLE_MAX));
+}
+
+void test_ph_zero_spikes_do_not_trigger_spiral(void) {
+    WaterAnomalyMonitor m;
+    uint32_t t = 0;
+    TEST_ASSERT_FALSE(feedAnomaly(m, 7.8f, 4.0f, t, 16));
+
+    // Dashboard-like dropouts: 8 → 0/2 → 8. Must not arm spiral.
+    for (int i = 0; i < 12; i++) {
+        TEST_ASSERT_FALSE(feedAnomaly(m, 0.0f, 4.0f, t, 1));
+        TEST_ASSERT_FALSE(feedAnomaly(m, 1.5f, 4.0f, t, 1));
+        TEST_ASSERT_FALSE(feedAnomaly(m, 7.9f, 4.0f, t, 2));
+        TEST_ASSERT_FALSE(feedAnomaly(m, 2.0f, 4.0f, t, 1));
+        TEST_ASSERT_FALSE(feedAnomaly(m, 7.7f, 4.0f, t, 3));
+    }
+    TEST_ASSERT_FALSE(m.shouldTriggerSpiral());
+}
+
+void test_ph_single_plausible_plunge_does_not_trigger(void) {
+    WaterAnomalyMonitor m;
+    uint32_t t = 0;
+    TEST_ASSERT_FALSE(feedAnomaly(m, 7.8f, 4.0f, t, 16));
+    // One 5.0 sample is a step glitch; hold last-good SMA near 7.8.
+    TEST_ASSERT_FALSE(feedAnomaly(m, 5.0f, 4.0f, t, 1));
+    TEST_ASSERT_FALSE(feedAnomaly(m, 7.8f, 4.0f, t, 20));
+    TEST_ASSERT_FALSE(m.shouldTriggerSpiral());
+}
+
+void test_sustained_acid_ph_triggers_after_dwell(void) {
+    WaterAnomalyMonitor m;
+    uint32_t t = 0;
+    // Cold-start pH 5.0 is plausible. Dwell starts on first out-of-range SMA.
+    TEST_ASSERT_FALSE(feedAnomaly(m, 5.0f, 4.0f, t, 16));
+    TEST_ASSERT_FALSE(m.shouldTriggerSpiral());
+    TEST_ASSERT_TRUE(feedAnomaly(m, 5.0f, 4.0f, t, 2));
+    TEST_ASSERT_TRUE(m.shouldTriggerSpiral());
+}
+
+void test_sustained_high_ph_day_triggers_after_dwell(void) {
+    WaterAnomalyMonitor m;
+    uint32_t t = 0;
+    TEST_ASSERT_FALSE(feedAnomaly(m, 9.6f, 4.0f, t, 16, 250, 14));
+    TEST_ASSERT_TRUE(feedAnomaly(m, 9.6f, 4.0f, t, 2, 250, 14));
+}
+
+void test_turbidity_wastewater_still_triggers(void) {
+    WaterAnomalyMonitor m;
+    uint32_t t = 0;
+    TEST_ASSERT_TRUE(feedAnomaly(m, 7.8f, 60.0f, t, 8));
+    TEST_ASSERT_TRUE(m.shouldTriggerSpiral());
+}
+
+void test_nan_ph_does_not_block_turbidity_spiral(void) {
+    WaterAnomalyMonitor m;
+    uint32_t t = 0;
+    TEST_ASSERT_TRUE(feedAnomaly(m, NAN, 60.0f, t, 8));
+    TEST_ASSERT_TRUE(m.shouldTriggerSpiral());
+}
+
+void test_anomaly_cooldown_blocks_retrigger(void) {
+    WaterAnomalyMonitor m;
+    uint32_t t = 0;
+    TEST_ASSERT_TRUE(feedAnomaly(m, 7.8f, 60.0f, t, 4));
+    m.notifySpiralDone(t);
+    TEST_ASSERT_FALSE(m.shouldTriggerSpiral());
+    TEST_ASSERT_FALSE(feedAnomaly(m, 7.8f, 60.0f, t, 8));
+    t += ANOMALY_COOLDOWN_MS;
+    TEST_ASSERT_TRUE(feedAnomaly(m, 7.8f, 60.0f, t, 1));
+}
+
+void test_confirmed_plume_jump_can_still_trigger(void) {
+    WaterAnomalyMonitor m;
+    uint32_t t = 0;
+    TEST_ASSERT_FALSE(feedAnomaly(m, 7.8f, 4.0f, t, 16));
+    // Real step: three agreeing 5.0 samples pass the glitch gate, then dwell.
+    TEST_ASSERT_FALSE(feedAnomaly(m, 5.0f, 4.0f, t, PH_GLITCH_CONFIRM_SAMPLES + 8));
+    TEST_ASSERT_TRUE(feedAnomaly(m, 5.0f, 4.0f, t, 20));
+}
+
 void test_fsm_gps_fault_latches_estop(void) {
     MissionFsm fsm;
     fsm.begin();
@@ -795,5 +900,14 @@ int main(int, char**) {
     RUN_TEST(test_fsm_force_rth_wins_over_force_spiral);
     RUN_TEST(test_fsm_start_blocked_on_low_battery);
     RUN_TEST(test_fsm_gps_fault_latches_estop);
+    RUN_TEST(test_ph_policy_rejects_dropout_band);
+    RUN_TEST(test_ph_zero_spikes_do_not_trigger_spiral);
+    RUN_TEST(test_ph_single_plausible_plunge_does_not_trigger);
+    RUN_TEST(test_sustained_acid_ph_triggers_after_dwell);
+    RUN_TEST(test_sustained_high_ph_day_triggers_after_dwell);
+    RUN_TEST(test_turbidity_wastewater_still_triggers);
+    RUN_TEST(test_nan_ph_does_not_block_turbidity_spiral);
+    RUN_TEST(test_anomaly_cooldown_blocks_retrigger);
+    RUN_TEST(test_confirmed_plume_jump_can_still_trigger);
     return UNITY_END();
 }

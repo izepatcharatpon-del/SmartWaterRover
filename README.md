@@ -75,7 +75,7 @@ test/test_navigation/
                     Unity tests on the host (no Arduino drivers)
 ```
 
-Logic that must stay unit-testable (`Navigator`, `MissionFsm`, `PidController`, `SafetyManager`, `SpiralPlanner`) does not include `Arduino.h`.
+Logic that must stay unit-testable (`Navigator`, `MissionFsm`, `PidController`, `SafetyManager`, `SpiralPlanner`, `WaterAnomalyMonitor`) does not include `Arduino.h`.
 
 ---
 

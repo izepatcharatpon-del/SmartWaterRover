@@ -1,4 +1,5 @@
 #include "WaterAnomalyMonitor.h"
+#include "PhPolicy.h"
 #include "config.h"
 #include <math.h>
 
@@ -7,14 +8,18 @@ WaterAnomalyMonitor::WaterAnomalyMonitor()
       _turbBaselineEma(0.0f), _lastTurb(0.0f),
       _lastSampleTime(0), _lastRocMs(0),
       _haveLastTurb(false),
+      _haveLastPh(false),
+      _lastAcceptedPh(7.0f),
+      _stepCandidatePh(7.0f),
+      _stepCandidateCount(0),
+      _phOutActive(false),
+      _phOutSince(0),
       _rawAnomaly(false),
       _triggerSpiral(false), _anomalyScore(0.0f), _turbRoc(0.0f),
       _cooldownUntil(0),
       _baselineHighSince(0),
       _baselineHighActive(false) {
     for (int i = 0; i < SMA_WINDOW; i++) { _phBuf[i] = 7.0f; _turbBuf[i] = 0.0f; }
-    _lastSampleTime = millis();
-    _lastRocMs = _lastSampleTime;
 }
 
 float WaterAnomalyMonitor::sma(const float* buf) const {
@@ -31,18 +36,59 @@ float WaterAnomalyMonitor::phHighLimitForHour(int hour) const {
     return PH_HIGH_LIMIT_NIGHT;
 }
 
+bool WaterAnomalyMonitor::acceptPhSample(float ph) {
+    if (!usvPhPlausible(ph)) {
+        _stepCandidateCount = 0;
+        return false;
+    }
+
+    if (!_haveLastPh) {
+        _lastAcceptedPh = ph;
+        _haveLastPh = true;
+        _stepCandidateCount = 0;
+        return true;
+    }
+
+    if (fabsf(ph - _lastAcceptedPh) <= PH_GLITCH_MAX_STEP) {
+        _lastAcceptedPh = ph;
+        _stepCandidateCount = 0;
+        return true;
+    }
+
+    if (_stepCandidateCount > 0 &&
+        fabsf(ph - _stepCandidatePh) <= PH_GLITCH_MAX_STEP) {
+        _stepCandidateCount++;
+        _stepCandidatePh = ph;
+    } else {
+        _stepCandidatePh = ph;
+        _stepCandidateCount = 1;
+    }
+
+    if (_stepCandidateCount >= PH_GLITCH_CONFIRM_SAMPLES) {
+        _lastAcceptedPh = ph;
+        _stepCandidateCount = 0;
+        return true;
+    }
+    return false;
+}
+
+float WaterAnomalyMonitor::phToStore(float ph) {
+    if (acceptPhSample(ph)) return ph;
+    return _haveLastPh ? _lastAcceptedPh : 7.0f;
+}
+
 bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
                                          bool sensorsValid, int hour,
-                                         bool motionDisturbance) {
+                                         bool motionDisturbance,
+                                         uint32_t nowMs) {
     if (!sensorsValid) {
         _triggerSpiral = false;
         return false;
     }
 
-    unsigned long now = millis();
-    _lastSampleTime = now;
+    _lastSampleTime = nowMs;
 
-    _phBuf[_bufIdx]   = ph;
+    _phBuf[_bufIdx]   = phToStore(ph);
     _turbBuf[_bufIdx] = turbidity;
     _bufIdx = (_bufIdx + 1) % SMA_WINDOW;
     if (_bufCount < SMA_WINDOW) _bufCount++;
@@ -52,18 +98,18 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
 
     if (!_haveLastTurb) {
         _lastTurb = turbAvg;
-        _lastRocMs = now;
+        _lastRocMs = nowMs;
         _haveLastTurb = true;
         _turbRoc = 0.0f;
-    } else if (now - _lastRocMs >= ANOMALY_ROC_WINDOW_MS) {
-        float dtMin = (now - _lastRocMs) / 60000.0f;
+    } else if (nowMs - _lastRocMs >= ANOMALY_ROC_WINDOW_MS) {
+        float dtMin = (nowMs - _lastRocMs) / 60000.0f;
         if (dtMin > 1e-4f && dtMin < 10.0f) {
             _turbRoc = (turbAvg - _lastTurb) / dtMin;
         } else {
             _turbRoc = 0.0f;
         }
         _lastTurb = turbAvg;
-        _lastRocMs = now;
+        _lastRocMs = nowMs;
     }
 
     if (_turbBaselineEma <= 0.0f) _turbBaselineEma = turbAvg;
@@ -71,7 +117,19 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
     float baselineDev = turbAvg - _turbBaselineEma;
 
     float phHigh = phHighLimitForHour(hour);
-    bool phOut   = (phAvg < PH_LOW_LIMIT) || (phAvg > phHigh);
+    bool phOutOfRange = _haveLastPh &&
+                        ((phAvg < PH_LOW_LIMIT) || (phAvg > phHigh));
+    if (phOutOfRange) {
+        if (!_phOutActive) {
+            _phOutActive = true;
+            _phOutSince = nowMs;
+        }
+    } else {
+        _phOutActive = false;
+    }
+    bool phOut = _phOutActive &&
+                 (nowMs - _phOutSince >= PH_ANOMALY_DWELL_MS);
+
     bool turbHigh = (turbAvg > TURBIDITY_WASTEWATER_NTU);
     bool turbSpike = (_turbRoc > TURBIDITY_ROC_LIMIT);
     if (motionDisturbance) {
@@ -82,14 +140,14 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
     if (baselineRising) {
         if (!_baselineHighActive) {
             _baselineHighActive = true;
-            _baselineHighSince = now;
+            _baselineHighSince = nowMs;
         }
     } else {
         _baselineHighActive = false;
     }
     bool baselineDwell =
         _baselineHighActive &&
-        (now - _baselineHighSince >= ANOMALY_BASELINE_DWELL_MS);
+        (nowMs - _baselineHighSince >= ANOMALY_BASELINE_DWELL_MS);
 
     (void)temp;
     float score = 0.0f;
@@ -112,7 +170,7 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
     }
 
     if (_rawAnomaly) {
-        if (now >= _cooldownUntil) {
+        if (nowMs >= _cooldownUntil) {
             _triggerSpiral = true;
         }
     } else {
@@ -122,8 +180,8 @@ bool WaterAnomalyMonitor::updateReadings(float ph, float turbidity, float temp,
     return _triggerSpiral;
 }
 
-void WaterAnomalyMonitor::notifySpiralDone() {
+void WaterAnomalyMonitor::notifySpiralDone(uint32_t nowMs) {
     _triggerSpiral = false;
-    _cooldownUntil = millis() + ANOMALY_COOLDOWN_MS;
+    _cooldownUntil = nowMs + ANOMALY_COOLDOWN_MS;
     _baselineHighActive = false;
 }

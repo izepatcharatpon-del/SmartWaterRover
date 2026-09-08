@@ -1,4 +1,5 @@
 #include "WaterSensors.h"
+#include "PhPolicy.h"
 #include "config.h"
 #include <Preferences.h>
 #include <math.h>
@@ -226,10 +227,10 @@ WaterReading WaterSensors::readPh(float tempC) {
 
     float phValue = phFromVoltageCalibrated(rawVoltage, tempC);
     if (!isfinite(phValue)) return r;
-    if (phValue < 0.0f)  phValue = 0.0f;
-    if (phValue > 14.0f) phValue = 14.0f;
+    // Do not clamp 0–14 and call it valid: a dropout that maps to ~0 must
+    // stay invalid so WaterAnomalyMonitor never arms spiral from it.
     r.value = phValue;
-    r.valid = true;
+    r.valid = usvPhPlausible(phValue);
     return r;
 }
 

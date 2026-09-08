@@ -197,12 +197,14 @@ void navigationTask(void* pv) {
         if (waterAdsDiv == 0) {
             phR   = ctx->water->readPh(temp);
             turbR = ctx->water->readTurbidityNtu();
+            // pH glitches are invalid; still run NTU anomaly on a good turb/temp pair.
             const bool sensorsValid =
-                phR.valid && turbR.valid && ctx->water->tempValid();
+                turbR.valid && ctx->water->tempValid();
+            const float phIn = phR.valid ? phR.value : NAN;
             anomaly = ctx->anomaly->updateReadings(
-                phR.value, turbR.value, temp, sensorsValid, hour,
-                motionDisturbance);
-        } else if (!phR.valid || !turbR.valid || !ctx->water->tempValid()) {
+                phIn, turbR.value, temp, sensorsValid, hour,
+                motionDisturbance, millis());
+        } else if (!turbR.valid || !ctx->water->tempValid()) {
             // Don't call updateReadings(false) — that wipes hysteresis.
             anomaly = false;
         } else {
@@ -539,7 +541,7 @@ void navigationTask(void* pv) {
         }
         if (state != STATE_SPIRAL_MAPPING) {
             if (prevState == STATE_SPIRAL_MAPPING) {
-                ctx->anomaly->notifySpiralDone();
+                ctx->anomaly->notifySpiralDone(millis());
                 anomaly = false;
             }
             spiralDone = false;

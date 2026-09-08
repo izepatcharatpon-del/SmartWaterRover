@@ -30,6 +30,7 @@ public:
     float getWaterTemp() const { return _waterTemp; }
     bool  tempValid() const { return _tempValid; }
 
+    // valid=false for implausible pH (dropouts ~0–2). Value is still the raw calc.
     WaterReading readPh(float tempC);
     WaterReading readTurbidityNtu();
     // Last ADS A1 volts from readTurbidityNtu (kept even when NTU is invalid).
