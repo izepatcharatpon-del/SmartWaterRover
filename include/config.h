@@ -63,22 +63,33 @@
 #define MOTOR_PWM_RES          8
 #define MOTOR_PWM_LIMIT        178
 #define MOTOR_MIN_PWM          80
-#define MOTOR_CRUISE_PWM       150
+#define MOTOR_CRUISE_PWM       130
 #define MOTOR_APPROACH_PWM     110
+#define MOTOR_PWM_SLEW_PER_SEC 600.0f // ~30 PWM per 50 ms navigation tick
 
 #define NAV_LOOP_PERIOD_MS     50
 #define WATER_ADS_EVERY_N_LOOPS 5
+#define ADS_RETRY_MS           5000UL  // re-init ADS if boot begin() failed
+// Coast at survey vertices so high-impedance water probes can be measured
+// without motor noise. The loop and all safety checks continue to run.
+#define WATER_SAMPLE_EVERY_N_WAYPOINTS 4
+#define WATER_SAMPLE_SETTLE_MS          500UL
+#define WATER_SAMPLE_MEASURE_MS        2500UL
+#define WATER_SAMPLE_HOLD_MS \
+    (WATER_SAMPLE_SETTLE_MS + WATER_SAMPLE_MEASURE_MS)
 #define HEADING_KP             2.50f
 #define HEADING_KI             0.05f
 #define HEADING_KD             0.80f
 #define PID_DERIV_ALPHA        0.30f
-#define WAYPOINT_RADIUS_M      2.5f
-#define LOS_LOOKAHEAD_M        2.0f   // shorter than 2.5 m → less corner cut
+#define WAYPOINT_RADIUS_M      3.0f
+#define GRID_LOS_LOOKAHEAD_M   6.0f   // gentler line capture on long GRID legs
+#define LOS_LOOKAHEAD_M        3.0f   // SPIRAL keeps its existing lookahead
 #define LOS_PASS_MARGIN_M      0.5f
 #define LOS_NEAR_SLOW_M        5.0f
-#define LOS_TURN_FIRST_DEG     25.0f  // in-place sooner; 35° still carved a wide arc
+#define LOS_TURN_FIRST_DEG     30.0f  // keep some surge vs 25° spin-in-place drift
+#define LOS_TURN_EXIT_DEG      20.0f  // hysteresis: do not chatter at 30°
 #define RTH_DEPART_RADIUS_M    12.0f
-#define RTH_ARRIVE_RADIUS_M    1.0f   // park on stored SET_HOME; GPS cannot hit 0 m
+#define RTH_ARRIVE_RADIUS_M    4.0f   // pond GPS wandered ~5 m; 1 m never held
 #define RTH_MIN_HOLD_MS        3000UL // must stay inside arrive radius this long
 #define RTH_DEPART_DWELL_MS    2000UL
 #define HEADING_STOP_TOL_DEG   3.0f
@@ -86,12 +97,17 @@
 
 // Pond GPS cannot hit a 0.45 m ball: the boat orbited each vertex (ellipse).
 // First ring and chord must stay outside SPIRAL_WAYPOINT_RADIUS_M.
-#define SPIRAL_A_M             5.0f
-#define SPIRAL_MAX_RADIUS_M    15.0f
+#define SPIRAL_A_M             4.0f
+#define SPIRAL_MAX_RADIUS_M    8.0f
 #define SPIRAL_MAX_THETA       (6.0f * 3.14159265f)   // 3 turns
 #define SPIRAL_B_M             ((SPIRAL_MAX_RADIUS_M - SPIRAL_A_M) / SPIRAL_MAX_THETA)
-#define SPIRAL_DTHETA          (3.14159265f / 4.0f)   // 45°; inner chord ~3.8 m
-#define SPIRAL_WAYPOINT_RADIUS_M 2.0f                 // same family as RTH arrive
+#define SPIRAL_DTHETA          (3.14159265f / 4.0f)   // 45°; inner chord ~3.1 m
+#define SPIRAL_WAYPOINT_RADIUS_M 2.0f                 // keep < inner chord ~3.1 m
+#define SPIRAL_POINT_TIMEOUT_MS  45000UL              // skip a vertex GPS cannot hit
+#define SPIRAL_MAX_MS            240000UL             // then return to GRID
+#define SPIRAL_CLEAR_ABORT_MS    8000UL               // water clean this long → leave
+// Do not arm spiral on WP0 (pond edge / launch). Index is 0-based.
+#define SPIRAL_MIN_WAYPOINT_INDEX 1
 
 #define PH_BUF_401             4.01f
 #define PH_BUF_686             6.86f
@@ -103,8 +119,10 @@
 #define PH_SLOPE_25C_V         0.05916f
 #define PH_SLOPE_SCALE         1.00f
 // Bench 2026-09-03 dip series (LM393 A → ADS A1). Not SEN0189 4.1 V.
-// dry 1.569 | clear 1.855 | mild 1.764 | step-2 discarded (1.782 clearer) | very turbid 1.20
-#define TURBIDITY_CLEAR_V      1.86f
+// dry 1.569 | clear 1.855 | mild 1.764 | very turbid 1.20
+// Pond-relative heatmap calibration from m_00005 GRID: P99 ~=1.92 V,
+// max 1.93 V. Values are useful for comparing this pond, not lab-grade NTU.
+#define TURBIDITY_CLEAR_V      1.93f
 #define TURBIDITY_DIRTY_V      1.20f
 #define TURBIDITY_DIRTY_NTU    80.0f
 #define TURBIDITY_FAULT_V      0.50f
@@ -113,18 +131,28 @@
 #define TURBIDITY_OPTICS_OK    1
 
 #define ANOMALY_CLEAR_HYST_NTU 10.0f
-#define ANOMALY_COOLDOWN_MS    45000UL
+// After leaving spiral; GRID will not re-enter on the same plume for 10 min.
+#define ANOMALY_COOLDOWN_MS    600000UL
+// Ignore repeated FORCE_SPIRAL commands for the same interval after any spiral exit.
+#define FORCE_SPIRAL_COOLDOWN_MS ANOMALY_COOLDOWN_MS
 #define ANOMALY_ROC_WINDOW_MS  2000UL
-#define ANOMALY_BASELINE_DELTA_NTU 12.0f
+#define ANOMALY_SENSOR_STALE_MS 1000UL // four missed 4 Hz ADS samples
+#define ANOMALY_BASELINE_DELTA_NTU 10.0f
 #define ANOMALY_BASELINE_DWELL_MS  4000UL
+// pH is heatmap-only until the water-coupled electrical fault is isolated.
+#define PH_PLAUSIBLE_MIN           1.0f
+#define PH_PLAUSIBLE_MAX           13.0f
+// In-liquid glass electrode ~1.5–3.5 V with this cal. ~4.8 V is open/dry.
+#define PH_ELECTRODE_V_MIN         1.50f
+#define PH_ELECTRODE_V_MAX         3.50f
 #define ANOMALY_DISTURBANCE_MS     3000UL
-#define TURBIDITY_WARNING_NTU  25.0f
+// Pond-relative 1.93 V clear / 1.20 V at 80: 10 units ~= 1.839 V.
+#define TURBIDITY_WARNING_NTU  10.0f
 #define TURBIDITY_WASTEWATER_NTU 50.0f
+// ROC is candidate/diagnostic only. Auto spiral requires either a complete
+// 8-sample average above WASTEWATER or baseline deviation + dwell.
 // 15 was SEN0189-scale; this head wobbles ~4 NTU in 2 s (~120/min) while held in sludge.
 #define TURBIDITY_ROC_LIMIT    200.0f
-#define PH_LOW_LIMIT           6.0f
-#define PH_HIGH_LIMIT_DAY      9.2f
-#define PH_HIGH_LIMIT_NIGHT    8.8f
 
 #define VOLTAGE_FULL           12.6f
 #define VOLTAGE_RTH            10.5f
@@ -135,6 +163,13 @@
 
 #define GPS_MIN_SATS           6
 #define GPS_MAX_HDOP           2.0f
+// Five seconds limits drift while retaining ~20 filtered samples.
+// It does not remove a persistent GNSS multipath bias.
+#define SET_HOME_DWELL_MS      5000UL
+#define SET_HOME_SAMPLE_MS     250UL
+#define SET_HOME_MIN_SAMPLES   20
+#define SET_HOME_MAX_SPREAD_M  8.0f
+#define SET_HOME_MAX_SPEED_KMH 1.5f
 #define GPS_FILTER_ALPHA       0.2f
 #define GPS_FILTER_ALPHA_FAST  0.55f
 #define GPS_FILTER_SPEED_KMH   0.8f

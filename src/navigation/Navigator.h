@@ -57,6 +57,9 @@ public:
 
     bool     isWaypointReached(double lat, double lon, double radiusM) const;
     void     advanceWaypoint();
+    // Advance one reached WP per tick, after segment progress or a near-track pass.
+    int      skipReached(double lat, double lon,
+                         double lookaheadM, double radiusM, double passMarginM);
     bool     missionComplete() const { return _count > 0 && _index >= _count; }
 
     LosGuidance computeLos(double lat, double lon,

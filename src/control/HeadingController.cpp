@@ -1,10 +1,16 @@
 #include "HeadingController.h"
 #include "config.h"
-#include <Arduino.h>
 #include <math.h>
 
+static int clampPwm(int pwm, int low, int high) {
+    if (pwm < low) return low;
+    if (pwm > high) return high;
+    return pwm;
+}
+
 HeadingController::HeadingController(float kp, float ki, float kd)
-    : _pid(kp, ki, kd, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT, PID_DERIV_ALPHA) {
+    : _pid(kp, ki, kd, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT, PID_DERIV_ALPHA),
+      _turnInPlace(false) {
     _pid.setAngular(true);
 }
 
@@ -21,35 +27,40 @@ void HeadingController::calculateThrusterOutputs(float targetBearing, float curr
     float error = computeHeadingError(targetBearing, currentHeading);
     float correction = _pid.update(error, dt);
 
-    int effectiveBase = basePwm;
-    if (fabsf(error) > LOS_TURN_FIRST_DEG) {
-        effectiveBase = 0;
+    const float absError = fabsf(error);
+    if (_turnInPlace) {
+        if (absError <= LOS_TURN_EXIT_DEG) {
+            _turnInPlace = false;
+        }
+    } else if (absError >= LOS_TURN_FIRST_DEG) {
+        _turnInPlace = true;
     }
 
-    if (effectiveBase == 0) {
-        if (fabsf(error) <= HEADING_STOP_TOL_DEG) {
+    if (_turnInPlace || basePwm <= 0) {
+        if (absError <= HEADING_STOP_TOL_DEG) {
             leftPwm = 0;
             rightPwm = 0;
         } else {
             int turn = (int)fabsf(correction);
-            turn = constrain(turn, MOTOR_MIN_PWM, MOTOR_PWM_LIMIT);
+            turn = clampPwm(turn, MOTOR_MIN_PWM, MOTOR_PWM_LIMIT);
             leftPwm  = (error > 0.0f) ? turn : -turn;
             rightPwm = -leftPwm;
         }
     } else {
-        leftPwm  = effectiveBase + (int)correction;
-        rightPwm = effectiveBase - (int)correction;
+        // Forward guidance may slow either side to zero, but must not command
+        // an unplanned reverse kick. Reverse is reserved for turn-in-place.
+        leftPwm  = clampPwm(basePwm + (int)correction, 0, MOTOR_PWM_LIMIT);
+        rightPwm = clampPwm(basePwm - (int)correction, 0, MOTOR_PWM_LIMIT);
 
         auto liftDeadband = [](int v) -> int {
             if (v == 0) return 0;
             if (v > 0 && v < MOTOR_MIN_PWM) return MOTOR_MIN_PWM;
-            if (v < 0 && v > -MOTOR_MIN_PWM) return -MOTOR_MIN_PWM;
             return v;
         };
         leftPwm  = liftDeadband(leftPwm);
         rightPwm = liftDeadband(rightPwm);
     }
 
-    leftPwm  = constrain(leftPwm,  -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
-    rightPwm = constrain(rightPwm, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
+    leftPwm  = clampPwm(leftPwm,  -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
+    rightPwm = clampPwm(rightPwm, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
 }

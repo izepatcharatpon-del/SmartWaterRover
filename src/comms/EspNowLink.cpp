@@ -109,6 +109,14 @@ bool EspNowLink::sendWithConfirm(const uint8_t* data, size_t len) {
     lastTx = {};
     lastTx.result = TX_RESULT_TIMEOUT;
     lastTx.sendErr = ESP_OK;
+    if (!_txDone) {
+        // Without the callback semaphore, a successful esp_now_send() only
+        // means the packet was queued locally. Never report that as peer ACK.
+        lastTx.result = TX_RESULT_SEND_ERR;
+        lastTx.sendErr = ESP_ERR_INVALID_STATE;
+        txFailCount++;
+        return false;
+    }
 
     uint8_t primary = 0;
     wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
@@ -139,10 +147,6 @@ bool EspNowLink::sendWithConfirm(const uint8_t* data, size_t len) {
             }
             lastTx.noAckCount++;
             lastTx.result = TX_RESULT_NO_ACK;
-        } else if (!_txDone) {
-            lastTx.result = TX_RESULT_OK;
-            lastTx.sendErr = ESP_OK;
-            return true;
         } else {
             lastTx.timeoutCount++;
             lastTx.result = TX_RESULT_TIMEOUT;

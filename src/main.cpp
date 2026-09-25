@@ -64,7 +64,12 @@ static void printPairingBanner(bool commsOk) {
     Serial.println(F("[USV] indoor: no GPS => STANDBY + motors stopped. Pass = telemetry ~1 Hz"));
     Serial.println(F("[USV] BOOT (not RST) in STANDBY = CALMAG; press again to save"));
     Serial.println(F("[USV] click this monitor, press any key to pause/resume TEL (not C = CALMAG)"));
-    Serial.println(F("[USV] turb: A1 from module pin A; NTU if turbV>=0.50 (clear~1.86 dirty~1.20)"));
+    Serial.printf(
+        "[USV] turb: A1 pond-relative if turbV>=%.2f (clear~%.2f dirty~%.2f)\n",
+        (double)TURBIDITY_FAULT_V,
+        (double)TURBIDITY_CLEAR_V,
+        (double)TURBIDITY_DIRTY_V);
+    Serial.println(F("[USV] TEL phV=ADS A0 turbV=ADS A1 t=DS18B20 C (raw even if ph/ntu nan)"));
 #if RADIO_TRACE
     Serial.println(F("[USV] radio trace [TX]/[RX] on this Serial — compare with gateway"));
 #endif
@@ -121,7 +126,7 @@ void setup() {
     motor.begin();
     const bool loggerOk = logger.begin();
     if (loggerOk) {
-        Serial.println(F("[USV] SD logger OK (SdFat)"));
+        Serial.printf("[USV] SD logger OK %s\n", logger.filename());
     } else {
         Serial.println(F("[USV] SD logger init FAILED — continuing without SD"));
     }
@@ -148,14 +153,25 @@ void setup() {
     ctx.wdt = &watchdog;
     ctx.safety = &safety; ctx.fsm = &fsm;
     ctx.batteryVoltage = VOLTAGE_FULL;
+    ctx.phVoltage = NAN;
     ctx.turbVoltage = NAN;
     ctx.homeDistM = NAN;
     ctx.homeSetFlag = 0;
+    ctx.snapshot.gps_lat = NAN;
+    ctx.snapshot.gps_lon = NAN;
+    ctx.snapshot.water_ph = NAN;
+    ctx.snapshot.water_turbidity = NAN;
+    ctx.snapshot.water_temp = NAN;
+    ctx.snapshot.heading_angle = NAN;
+    ctx.telemetryTxLat = NAN;
+    ctx.telemetryTxLon = NAN;
+    ctx.telemetryTxPh = NAN;
+    ctx.telemetryRadioStatus = TELEMETRY_RADIO_NEVER;
     ctx.logDropCount = 0;
     ctx.ackDropCount = 0;
     ctx.stageDropCount = 0;
 
-    ctx.logQueue   = xQueueCreate(16, sizeof(TelemetryPacket));
+    ctx.logQueue   = xQueueCreate(16, sizeof(SdLogRecord));
     ctx.stageQueue = xQueueCreate(STAGE_STATUS_QUEUE_LENGTH,
                                   sizeof(StageStatusPacket));
     ctx.stateMutex = xSemaphoreCreateMutex();

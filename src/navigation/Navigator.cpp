@@ -214,6 +214,37 @@ void Navigator::advanceWaypoint() {
     if (_index < _count) _index++;
 }
 
+int Navigator::skipReached(double lat, double lon,
+                           double lookaheadM, double radiusM, double passMarginM) {
+    if (missionComplete() || _index >= _count) return 0;
+
+    const LosGuidance los = computeLos(lat, lon, lookaheadM,
+                                       radiusM, passMarginM);
+    if (!los.valid) return 0;
+
+    float minAlongM = 0.5f;
+    if (_index > 0) {
+        const Waypoint start = segmentStart();
+        const Waypoint end = currentTarget();
+        const double segmentLengthM = calculateDistance(
+            start.lat, start.lon, end.lat, end.lon);
+        // A 3 m acceptance ball can contain both ends of a short GRID turn.
+        // Require progress along that segment before accepting its endpoint.
+        minAlongM = segmentLengthM < 0.05 ? 0.0f :
+            (float)fmin(2.0, segmentLengthM * 0.75);
+    }
+
+    const bool reachedWithProgress =
+        los.reached && los.alongTrackM >= minAlongM;
+    const bool passedNearTrack =
+        los.passed && fabsf(los.crossTrackM) <= radiusM;
+    if (!reachedWithProgress && !passedNearTrack) return 0;
+
+    // Advance only once per navigation tick, including spiral entry.
+    advanceWaypoint();
+    return 1;
+}
+
 LosGuidance Navigator::computeSegmentLos(double lat, double lon,
                                          const Waypoint& start,
                                          const Waypoint& end,

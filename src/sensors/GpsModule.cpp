@@ -126,9 +126,34 @@ GpsFix GpsModule::getFilteredFix() {
     fix.lat   = _filtLat;
     fix.lon   = _filtLon;
     fix.hdop  = _gps.hdop.isValid() ? _gps.hdop.hdop() : 99.0f;
+    fix.speedKmh = 0.0f;
+    if (_gps.speed.isValid() &&
+        const_cast<TinyGPSSpeed&>(_gps.speed).age() < GPS_FRESH_FIX_MS) {
+        fix.speedKmh = (float)const_cast<TinyGPSSpeed&>(_gps.speed).kmph();
+    }
     fix.sats  = _gps.satellites.isValid() ? _gps.satellites.value() : 0;
     fix.valid = _filterInit && !_faultLatched && hasFreshFix();
     return fix;
+}
+
+bool GpsModule::getRawPosition(double& lat, double& lon) {
+    if (!_gps.location.isValid() ||
+        _gps.location.age() > GPS_FRESH_FIX_MS) return false;
+    lat = _gps.location.lat();
+    lon = _gps.location.lng();
+    return true;
+}
+
+float GpsModule::courseDeg() {
+    if (!_gps.course.isValid() ||
+        _gps.course.age() > GPS_FRESH_FIX_MS) return NAN;
+    // Course over ground is diagnostic only; it can be noisy at low speed.
+    return (float)_gps.course.deg();
+}
+
+uint32_t GpsModule::locationAgeMs() {
+    if (!_gps.location.isValid()) return UINT32_MAX;
+    return (uint32_t)_gps.location.age();
 }
 
 unsigned long GpsModule::timeSinceFix() const {
@@ -161,4 +186,26 @@ int GpsModule::localHour() const {
     hour = (hour + GPS_TIMEZONE_OFFSET_H) % 24;
     if (hour < 0) hour += 24;
     return hour;
+}
+
+GpsDateTime GpsModule::utcNow() const {
+    GpsDateTime t = {};
+    TinyGPSDate& date = const_cast<TinyGPSDate&>(_gps.date);
+    TinyGPSTime& time = const_cast<TinyGPSTime&>(_gps.time);
+    if (!date.isValid() || !time.isValid()) return t;
+    if (date.age() > 5000 || time.age() > 5000) return t;
+    uint16_t year = (uint16_t)date.year();
+    if (year < 100) year = (uint16_t)(year + 2000);
+    const uint8_t month = (uint8_t)date.month();
+    const uint8_t day = (uint8_t)date.day();
+    if (year < 2020 || year > 2099) return t;
+    if (month < 1 || month > 12 || day < 1 || day > 31) return t;
+    t.year = year;
+    t.month = month;
+    t.day = day;
+    t.hour = (uint8_t)time.hour();
+    t.minute = (uint8_t)time.minute();
+    t.second = (uint8_t)time.second();
+    t.valid = true;
+    return t;
 }

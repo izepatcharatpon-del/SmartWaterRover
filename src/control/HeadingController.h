@@ -17,10 +17,12 @@ public:
                                   int basePwm, float dt,
                                   int& leftPwm, int& rightPwm);
 
-    void reset() { _pid.reset(); }
+    void reset() { _pid.reset(); _turnInPlace = false; }
+    bool isTurningInPlace() const { return _turnInPlace; }
 
 private:
     PidController _pid;
+    bool _turnInPlace;
 };
 
 #endif // USV_HEADING_CONTROLLER_H

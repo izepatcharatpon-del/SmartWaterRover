@@ -61,6 +61,7 @@ struct SystemContext {
     TelemetryPacket   snapshot;
     CommandState      command;
     float             batteryVoltage;
+    float             phVoltage;
     float             turbVoltage;
     uint8_t           compassAddr;
     uint8_t           compassFailCount;
@@ -75,6 +76,13 @@ struct SystemContext {
     uint32_t          ackDropCount;
     uint32_t          stageDropCount;
     bool              radioTxPaused;
+    uint32_t          telemetryTxSeq;
+    uint32_t          telemetryTxMs;
+    double            telemetryTxLat;
+    double            telemetryTxLon;
+    float             telemetryTxPh;
+    uint8_t           telemetryRadioStatus;
+    uint8_t           telemetryTxAttempts;
 };
 
 void navigationTask(void* pv);

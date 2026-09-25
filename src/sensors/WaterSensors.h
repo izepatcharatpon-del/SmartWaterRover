@@ -7,8 +7,8 @@
 #include <DallasTemperature.h>
 
 struct WaterReading {
-    float value;
-    bool  valid;
+    float value;  // computed reading; NAN when ADS/calculation produced nothing
+    bool  valid;  // quality flag (pH is diagnostic-only, not a spiral trigger)
 };
 
 // 3-point pH cal @ 25 °C — buffers 4.01 / 6.86 / 9.18
@@ -25,6 +25,9 @@ public:
     WaterSensors();
 
     bool begin();
+    bool adsReady() const { return _adsReady; }
+    // Retry ADS begin() if the first attempt failed. No delay().
+    bool pollAds(unsigned long nowMs);
 
     void  updateTemperatureNonBlocking();
     float getWaterTemp() const { return _waterTemp; }
@@ -32,7 +35,8 @@ public:
 
     WaterReading readPh(float tempC);
     WaterReading readTurbidityNtu();
-    // Last ADS A1 volts from readTurbidityNtu (kept even when NTU is invalid).
+    // Last ADS A0/A1 volts (kept even when pH/NTU are invalid).
+    float lastPhVoltage() const { return _lastPhVoltage; }
     float lastTurbVoltage() const { return _lastTurbVoltage; }
 
     // --- pH calibration (buffers @ 25 °C) ---
@@ -71,10 +75,12 @@ private:
     float             _waterTemp;
     bool              _tempValid;
     bool              _adsReady;
+    unsigned long     _lastAdsRetryMs;
     PhCalibration     _phCal;
 
     float _vCap401, _vCap686, _vCap918;
     bool  _cap401, _cap686, _cap918;
+    float _lastPhVoltage;
     float _lastTurbVoltage;
 
     bool readChannelVoltage(uint8_t channel, float& outV);

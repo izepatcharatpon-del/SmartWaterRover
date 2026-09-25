@@ -7,8 +7,8 @@
 # Keep git firmware-only. Notes under docs/ stay on this machine.
 docs/
 simulation/
+.cursor/
 *.md
 !README.md
-!.cursor/skills/**/SKILL.md
 *.log
 *.txt

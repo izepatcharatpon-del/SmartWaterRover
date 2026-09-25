@@ -1,33 +1,87 @@
 #include "core/Tasks.h"
 #include "core/StageReporter.h"
+#include "core/WaterSamplePolicy.h"
+#include "control/DriveController.h"
 #include "config.h"
+#include <Preferences.h>
 #include <math.h>
 #include <string.h>
 
 static double g_homeLat = 0.0, g_homeLon = 0.0;
 static bool   g_homeSet = false;
+static bool   g_homeCapturing = false;
+static uint32_t g_homeCapStartMs = 0;
+static uint32_t g_homeCapLastSampleMs = 0;
+static MissionFsm::HomeCapture g_homeCap = {};
 static bool   g_homeLeft = false;
 static uint32_t g_homeOutsideAccumMs = 0;
 static float    g_rthEntryDistM = NAN;
 static uint32_t g_rthEnterMs = 0;
 static uint32_t g_rthInsideAccumMs = 0;
 
+static const char* HOME_NVS_NS  = "usv_home";
+static const char* HOME_NVS_LAT = "lat";
+static const char* HOME_NVS_LON = "lon";
+static const char* HOME_NVS_OK  = "ok";
+
+static bool homeCoordsSane(double lat, double lon) {
+    if (!isfinite(lat) || !isfinite(lon)) return false;
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return false;
+    if (lat == 0.0 && lon == 0.0) return false;
+    return true;
+}
+
+static void saveHomeToNvs(double lat, double lon) {
+    Preferences prefs;
+    if (!prefs.begin(HOME_NVS_NS, false)) {
+        Serial.println(F("[USV] SET_HOME NVS write failed"));
+        return;
+    }
+    prefs.putDouble(HOME_NVS_LAT, lat);
+    prefs.putDouble(HOME_NVS_LON, lon);
+    prefs.putUChar(HOME_NVS_OK, 1);
+    prefs.end();
+}
+
+static bool loadHomeFromNvs(double& lat, double& lon) {
+    Preferences prefs;
+    if (!prefs.begin(HOME_NVS_NS, true)) return false;
+    const bool ok = prefs.getUChar(HOME_NVS_OK, 0) != 0;
+    lat = prefs.getDouble(HOME_NVS_LAT, 0.0);
+    lon = prefs.getDouble(HOME_NVS_LON, 0.0);
+    prefs.end();
+    return ok && homeCoordsSane(lat, lon);
+}
+
 static Waypoint g_spiralTgt = {0.0, 0.0};
 static Waypoint g_spiralStart = {0.0, 0.0};
 static bool     g_haveSpiralTgt = false;
 static bool     g_spiralInitialized = false;
-
-static bool radioSendsWaterQuality(uint8_t mode) {
-    return mode == STATE_GRID_PATROL ||
-           mode == STATE_SPIRAL_MAPPING ||
-           mode == STATE_RTH;
-}
+static uint32_t g_spiralEnterMs = 0;
+static uint32_t g_spiralPointMs = 0;
+static uint32_t g_spiralCleanSinceMs = 0;
+static bool     g_spiralFromForce = false;
+static const char* g_spiralAbortWhy = nullptr;
+static bool     g_waterSampleActive = false;
+static uint32_t g_waterSampleStartMs = 0;
+static float    g_phQuietSum = 0.0f;
+static uint16_t g_phQuietCount = 0;
 
 static int chooseBasePwm(float headingErrorDeg, float distToEndM, int cruisePwm) {
     float absErr = fabsf(headingErrorDeg);
     if (absErr > LOS_TURN_FIRST_DEG) return 0;
     if (distToEndM < LOS_NEAR_SLOW_M) return MOTOR_APPROACH_PWM;
     return cruisePwm;
+}
+
+static uint8_t radioStatusForLog(EspNowLink::TxResult result) {
+    switch (result) {
+        case EspNowLink::TX_RESULT_OK:       return TELEMETRY_RADIO_ACK;
+        case EspNowLink::TX_RESULT_NO_ACK:   return TELEMETRY_RADIO_NO_ACK;
+        case EspNowLink::TX_RESULT_SEND_ERR: return TELEMETRY_RADIO_SEND_ERR;
+        case EspNowLink::TX_RESULT_TIMEOUT:  return TELEMETRY_RADIO_TIMEOUT;
+    }
+    return TELEMETRY_RADIO_TIMEOUT;
 }
 
 static void toggleRadioTxPause(SystemContext* ctx) {
@@ -159,18 +213,31 @@ void navigationTask(void* pv) {
     bool haveLastLosTarget = false;
     StageStatusPacket lastStageStatus = {};
     bool haveLastStageStatus = false;
+    bool lastManualMode = false;
     unsigned long lastHardThrustMs = 0;
     int lastAbsPwm = 0;
     bool hadHardThrust = false;
+    DriveController driveController(
+        MOTOR_PWM_LIMIT, MOTOR_MIN_PWM, MOTOR_PWM_SLEW_PER_SEC);
 
     TickType_t lastWake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(NAV_LOOP_PERIOD_MS);
     uint32_t lastLoopUs = micros();
 
+    if (loadHomeFromNvs(g_homeLat, g_homeLon)) {
+        g_homeSet = true;
+        g_homeLeft = false;
+        Serial.printf("[USV] home from NVS lat=%.6f lon=%.6f\n",
+                      g_homeLat, g_homeLon);
+    }
+
     // ADS ~16 ms — do not run every 50 ms tick.
     uint8_t waterAdsDiv = 0;
     WaterReading phR   = {NAN, false};
     WaterReading turbR = {NAN, false};
+    float lastPh = NAN;
+    float lastNtu = NAN;
+    float lastTemp = NAN;
     bool anomaly = false;
 
     for (;;) {
@@ -183,33 +250,77 @@ void navigationTask(void* pv) {
         ctx->gps->update();
         ctx->compass->update();
         ctx->water->updateTemperatureNonBlocking();
+        const bool adsWasReady = ctx->water->adsReady();
+        if (ctx->water->pollAds(millis()) && !adsWasReady) {
+            Serial.println(F("[USV] ADS1115 recovered"));
+        }
 
         GpsFix fix     = ctx->gps->getFilteredFix();
+        double rawGpsLat = NAN, rawGpsLon = NAN;
+        ctx->gps->getRawPosition(rawGpsLat, rawGpsLon);
+        const float gpsCourseDeg = ctx->gps->courseDeg();
+        const uint32_t gpsLocationAgeMs = ctx->gps->locationAgeMs();
         float  heading = ctx->compass->getHeadingDeg();
         bool   compassOk = ctx->compass->isOk() && isfinite(heading);
         float  temp    = ctx->water->getWaterTemp();
         float  battV   = ctx->battery->readVoltage();
-        int hour = ctx->gps->localHour();
-
         const bool motionDisturbance =
             hadHardThrust &&
             (millis() - lastHardThrustMs) < ANOMALY_DISTURBANCE_MS;
+        const BoatState navState = ctx->fsm->state();
+        const bool watchWater =
+            (navState == STATE_GRID_PATROL ||
+             navState == STATE_SPIRAL_MAPPING);
+        bool waterAdsSampled = false;
         if (waterAdsDiv == 0) {
+            waterAdsSampled = true;
             phR   = ctx->water->readPh(temp);
             turbR = ctx->water->readTurbidityNtu();
-            const bool sensorsValid =
-                phR.valid && turbR.valid && ctx->water->tempValid();
-            anomaly = ctx->anomaly->updateReadings(
-                phR.value, turbR.value, temp, sensorsValid, hour,
-                motionDisturbance);
-        } else if (!phR.valid || !turbR.valid || !ctx->water->tempValid()) {
-            // Don't call updateReadings(false) — that wipes hysteresis.
-            anomaly = false;
-        } else {
+            if (watchWater) {
+                if (turbR.valid) {
+                    anomaly = ctx->anomaly->updateTurbidity(
+                        turbR.value, motionDisturbance, millis());
+                } else {
+                    ctx->anomaly->notifyTurbidityInvalid(millis());
+                    anomaly = ctx->anomaly->shouldTriggerSpiral();
+                }
+            } else {
+                anomaly = false;
+            }
+        } else if (watchWater) {
             anomaly = ctx->anomaly->shouldTriggerSpiral();
+        } else {
+            anomaly = false;
         }
         if (++waterAdsDiv >= WATER_ADS_EVERY_N_LOOPS) {
             waterAdsDiv = 0;
+        }
+        const uint32_t waterSampleElapsed =
+            g_waterSampleActive ? millis() - g_waterSampleStartMs : 0;
+        const bool phQuietMeasure =
+            navState == STATE_GRID_PATROL && g_waterSampleActive &&
+            waterSampleElapsed >= WATER_SAMPLE_SETTLE_MS &&
+            waterSampleElapsed < WATER_SAMPLE_HOLD_MS;
+        if (!phQuietMeasure) {
+            // Never smear a quiet waypoint pH value along the moving track.
+            lastPh = NAN;
+        } else if (waterAdsSampled) {
+            // Report every finite calibrated conversion during the quiet
+            // window. The quality gate remains in WaterReading::valid for
+            // diagnostics, but does not suppress telemetry at this waypoint.
+            if (isfinite(phR.value)) {
+                g_phQuietSum += phR.value;
+                g_phQuietCount++;
+                lastPh = g_phQuietSum / (float)g_phQuietCount;
+            } else if (g_phQuietCount == 0) {
+                lastPh = NAN;
+            }
+        }
+        if (turbR.valid && isfinite(turbR.value)) {
+            lastNtu = turbR.value;
+        }
+        if (ctx->water->tempValid()) {
+            lastTemp = temp;
         }
 
         WaypointArrayPacket wps;
@@ -375,6 +486,11 @@ void navigationTask(void* pv) {
                 }
             }
         }
+        if (cmd.manualMode != lastManualMode) {
+            ctx->heading->reset();
+            haveLastLosTarget = false;
+            lastManualMode = cmd.manualMode;
+        }
 
         const bool underLoad = (lastAbsPwm >= BATTERY_LOAD_PWM_THRESH) ||
                                motionDisturbance;
@@ -388,25 +504,86 @@ void navigationTask(void* pv) {
                 ctx->command.setHome = false;
                 xSemaphoreGive(ctx->stateMutex);
             }
-            if (ctx->fsm->state() == STATE_STANDBY && gpsOk && fix.valid) {
-                g_homeLat = fix.lat;
-                g_homeLon = fix.lon;
-                g_homeSet = true;
-                g_homeLeft = false;
-                g_homeOutsideAccumMs = 0;
-                Serial.printf("[USV] SET_HOME lat=%.6f lon=%.6f\n",
-                              g_homeLat, g_homeLon);
-            } else {
-                Serial.println(F("[USV] SET_HOME refused — need STANDBY and GPS OK"));
+            if (!g_homeCapturing) {
+                if (ctx->fsm->state() == STATE_STANDBY && gpsOk && fix.valid) {
+                    MissionFsm::homeCaptureReset(g_homeCap);
+                    g_homeCapturing = true;
+                    g_homeCapStartMs = millis();
+                    g_homeCapLastSampleMs = 0;
+                    Serial.printf("[USV] SET_HOME capturing — keep still %lus\n",
+                                  (unsigned long)(SET_HOME_DWELL_MS / 1000UL));
+                } else {
+                    Serial.println(F("[USV] SET_HOME refused — need STANDBY and GPS OK"));
+                }
             }
         }
 
+        if (g_homeCapturing) {
+            if (ctx->fsm->state() != STATE_STANDBY || !gpsOk || !fix.valid) {
+                g_homeCapturing = false;
+                Serial.println(F("[USV] SET_HOME aborted — need STANDBY and GPS OK"));
+            } else if (fix.speedKmh > SET_HOME_MAX_SPEED_KMH) {
+                g_homeCapturing = false;
+                Serial.printf("[USV] SET_HOME aborted — moving %.1f km/h\n",
+                              (double)fix.speedKmh);
+            } else {
+                const uint32_t nowMs = millis();
+                if (g_homeCapLastSampleMs == 0 ||
+                    (nowMs - g_homeCapLastSampleMs) >= SET_HOME_SAMPLE_MS) {
+                    MissionFsm::homeCaptureAdd(g_homeCap, fix.lat, fix.lon);
+                    g_homeCapLastSampleMs = nowMs;
+                }
+                if ((nowMs - g_homeCapStartMs) >= SET_HOME_DWELL_MS) {
+                    double lat = 0.0, lon = 0.0;
+                    const float spreadM = MissionFsm::homeCaptureSpreadM(g_homeCap);
+                    const bool haveMean =
+                        MissionFsm::homeCaptureMean(g_homeCap, lat, lon);
+                    g_homeCapturing = false;
+                    if (haveMean &&
+                        g_homeCap.count >= SET_HOME_MIN_SAMPLES &&
+                        spreadM <= SET_HOME_MAX_SPREAD_M) {
+                        g_homeLat = lat;
+                        g_homeLon = lon;
+                        g_homeSet = true;
+                        g_homeLeft = false;
+                        g_homeOutsideAccumMs = 0;
+                        saveHomeToNvs(g_homeLat, g_homeLon);
+                        Serial.printf(
+                            "[USV] SET_HOME lat=%.6f lon=%.6f n=%u spread=%.1fm\n",
+                            g_homeLat, g_homeLon,
+                            (unsigned)g_homeCap.count, (double)spreadM);
+                    } else {
+                        Serial.printf(
+                            "[USV] SET_HOME refused — n=%u spread=%.1fm (retry still)\n",
+                            (unsigned)g_homeCap.count, (double)spreadM);
+                    }
+                }
+            }
+        }
+
+        const uint32_t decisionNowMs = millis();
         if (cmd.forceSpiral && ctx->fsm->state() != STATE_GRID_PATROL) {
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 ctx->command.forceSpiral = false;
                 xSemaphoreGive(ctx->stateMutex);
             }
             Serial.println(F("[USV] FORCE_SPIRAL refused — need GRID_PATROL"));
+            cmd.forceSpiral = false;
+        } else if (cmd.forceSpiral &&
+                   ctx->nav->index() < SPIRAL_MIN_WAYPOINT_INDEX) {
+            if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                ctx->command.forceSpiral = false;
+                xSemaphoreGive(ctx->stateMutex);
+            }
+            Serial.println(F("[USV] FORCE_SPIRAL refused — pass first waypoint"));
+            cmd.forceSpiral = false;
+        } else if (cmd.forceSpiral &&
+                   ctx->fsm->forceSpiralCooldownActive(decisionNowMs)) {
+            if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                ctx->command.forceSpiral = false;
+                xSemaphoreGive(ctx->stateMutex);
+            }
+            Serial.println(F("[USV] FORCE_SPIRAL refused — cooldown"));
             cmd.forceSpiral = false;
         }
 
@@ -417,9 +594,28 @@ void navigationTask(void* pv) {
         in.emergencyCommand    = cmd.emergency;
         in.forceRthCommand     = cmd.forceRth;
         in.forceSpiralCommand  = cmd.forceSpiral;
+        in.nowMs               = decisionNowMs;
         in.anomalyDetected     = anomaly;
         in.spiralComplete   = spiralDone;
-        in.gridComplete     = ctx->nav->missionComplete();
+        in.spiralAborted    = false;
+        if (ctx->fsm->state() == STATE_SPIRAL_MAPPING && g_spiralInitialized) {
+            const uint32_t nowMs = millis();
+            if ((nowMs - g_spiralEnterMs) >= SPIRAL_MAX_MS) {
+                in.spiralAborted = true;
+                g_spiralAbortWhy = "wall";
+            } else if (!g_spiralFromForce && !anomaly) {
+                if (g_spiralCleanSinceMs == 0) {
+                    g_spiralCleanSinceMs = nowMs;
+                } else if ((nowMs - g_spiralCleanSinceMs) >= SPIRAL_CLEAR_ABORT_MS) {
+                    in.spiralAborted = true;
+                    g_spiralAbortWhy = "clean";
+                }
+            } else {
+                g_spiralCleanSinceMs = 0;
+            }
+        }
+        in.gridComplete = WaterSamplePolicy::missionCompleteForFsm(
+            ctx->nav->missionComplete(), g_waterSampleActive);
         float distHomeM = NAN;
         if (g_homeSet && fix.valid) {
             distHomeM = (float)Navigator::calculateDistance(
@@ -442,10 +638,27 @@ void navigationTask(void* pv) {
         in.homeSet          = g_homeSet;
         in.compassOk        = compassOk;
         in.hasWaypoints     = ctx->nav->isMissionReady();
+        in.passedFirstWaypoint =
+            ctx->nav->index() >= SPIRAL_MIN_WAYPOINT_INDEX;
         in.safety           = safety;
+        static bool loggedSpiralHold = false;
+        if (in.passedFirstWaypoint) {
+            loggedSpiralHold = false;
+        } else if (anomaly &&
+                   ctx->fsm->state() == STATE_GRID_PATROL &&
+                   !loggedSpiralHold) {
+            loggedSpiralHold = true;
+            Serial.println(F("[USV] SPIRAL hold — pass first waypoint"));
+        }
 
         BoatState stateBefore = ctx->fsm->state();
         BoatState state = ctx->fsm->tick(in);
+        if (state != prevState) {
+            // Bearing ownership changed. Do not carry PID derivative/integral
+            // or turn hysteresis from GRID/manual/SPIRAL/RTH into the next mode.
+            ctx->heading->reset();
+            haveLastLosTarget = false;
+        }
 
         const bool startAccepted =
             stateBefore == STATE_STANDBY && state == STATE_GRID_PATROL;
@@ -490,6 +703,8 @@ void navigationTask(void* pv) {
         }
 
         if (state == STATE_GRID_PATROL && prevState == STATE_STANDBY) {
+            ctx->anomaly->clearPendingTrigger();
+            anomaly = false;
             if (fix.valid) {
                 g_homeLeft = false;
                 g_homeOutsideAccumMs = 0;
@@ -504,8 +719,6 @@ void navigationTask(void* pv) {
                 } else {
                     Serial.println(F("[USV] no home — SET_HOME before RTH"));
                 }
-            } else {
-                ctx->motor->stop();
             }
             ctx->heading->reset();
             haveLastLosTarget = false;
@@ -531,15 +744,49 @@ void navigationTask(void* pv) {
         }
 
         if (state == STATE_SPIRAL_MAPPING && prevState != STATE_SPIRAL_MAPPING) {
+            if (fix.valid) {
+                const int skipped = ctx->nav->skipReached(
+                    fix.lat, fix.lon,
+                    GRID_LOS_LOOKAHEAD_M, WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M);
+                if (skipped > 0) {
+                    Serial.printf("[USV] spiral enter skipped %d wp idx=%d\n",
+                                  skipped, ctx->nav->index());
+                }
+            }
             spiralDone = false;
             g_haveSpiralTgt = false;
             g_spiralInitialized = false;
+            g_spiralEnterMs = millis();
+            g_spiralPointMs = g_spiralEnterMs;
+            g_spiralCleanSinceMs = 0;
+            g_spiralFromForce = forceSpiralAccepted;
+            g_spiralAbortWhy = nullptr;
             ctx->heading->reset();
             haveLastLosTarget = false;
+            if (!forceSpiralAccepted) {
+                Serial.printf(
+                    "[USV] SPIRAL turbidity ntu=%.1f ph_context=%.2f\n",
+                    isfinite(turbR.value) ? (double)turbR.value : NAN,
+                    isfinite(phR.value) ? (double)phR.value : NAN);
+            }
         }
         if (state != STATE_SPIRAL_MAPPING) {
             if (prevState == STATE_SPIRAL_MAPPING) {
-                ctx->anomaly->notifySpiralDone();
+                if (g_spiralAbortWhy) {
+                    Serial.printf("[USV] spiral abort %s\n", g_spiralAbortWhy);
+                    g_spiralAbortWhy = nullptr;
+                }
+                const bool completedAutomaticSpiral =
+                    !g_spiralFromForce &&
+                    state == STATE_GRID_PATROL &&
+                    (in.spiralComplete || in.spiralAborted);
+                if (completedAutomaticSpiral) {
+                    ctx->anomaly->notifySpiralDone(millis());
+                } else {
+                    // A forced demo or safety/RTH interruption must not hide a
+                    // real plume for the full anomaly cooldown.
+                    ctx->anomaly->clearPendingTrigger();
+                }
                 anomaly = false;
             }
             spiralDone = false;
@@ -571,60 +818,119 @@ void navigationTask(void* pv) {
         }
 
         int leftPwm = 0, rightPwm = 0;
+        DriveSource driveSource = DriveSource::NONE;
+        bool driveRequestValid = false;
+        int logBasePwm = 0;
+        double logTargetLat = NAN, logTargetLon = NAN;
+        float logNavBearing = NAN;
+        float logCrossTrack = NAN;
+        float logDistToTarget = NAN;
+        float logHeadingError = NAN;
+        float logDirectBearing = NAN;
+        uint8_t logWaterSamplePhase = 0;
+        uint32_t logWaterSampleMs = 0;
         bool navSensorsOk = gpsOk && compassOk;
+
+        if (state != STATE_GRID_PATROL) {
+            g_waterSampleActive = false;
+        }
 
         switch (state) {
             case STATE_STANDBY:
             case STATE_EMERGENCY_STOP:
-                ctx->motor->stop();
                 ctx->heading->reset();
                 break;
 
             case STATE_GRID_PATROL: {
                 if (cmd.manualMode) {
+                    g_waterSampleActive = false;
                     leftPwm  = constrain(cmd.manualSpeed + cmd.manualSteer,
                                          -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
                     rightPwm = constrain(cmd.manualSpeed - cmd.manualSteer,
                                          -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
-                } else if (navSensorsOk && ctx->nav->hasWaypoints() &&
-                           !ctx->nav->missionComplete()) {
-                    LosGuidance los = ctx->nav->computeLos(
-                        fix.lat, fix.lon,
-                        LOS_LOOKAHEAD_M, WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M);
-
-                    const bool reachedWithProgress =
-                        los.reached &&
-                        (ctx->nav->index() > 0 || los.alongTrackM >= 0.5f);
-                    if (los.valid && (reachedWithProgress || los.passed)) {
-                        ctx->nav->advanceWaypoint();
-                        ctx->heading->reset();
-                        haveLastLosTarget = false;
-                        if (!ctx->nav->missionComplete()) {
-                            los = ctx->nav->computeLos(
-                                fix.lat, fix.lon,
-                                LOS_LOOKAHEAD_M, WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M);
+                    driveSource = DriveSource::MANUAL;
+                    driveRequestValid = true;
+                } else {
+                    if (g_waterSampleActive) {
+                        const uint32_t elapsed = millis() - g_waterSampleStartMs;
+                        if (elapsed >= WATER_SAMPLE_HOLD_MS) {
+                            g_waterSampleActive = false;
+                            ctx->heading->reset();
+                            haveLastLosTarget = false;
+                            Serial.println(F("[USV] water sample done"));
                         } else {
-                            los.valid = false;
+                            logWaterSampleMs = elapsed;
+                            logWaterSamplePhase =
+                                elapsed < WATER_SAMPLE_SETTLE_MS ? 1 : 2;
                         }
                     }
 
-                    if (los.valid && !ctx->nav->missionComplete()) {
-                        Waypoint tgt = ctx->nav->currentTarget();
-                        if (haveLastLosTarget &&
-                            (tgt.lat != lastLosTarget.lat || tgt.lon != lastLosTarget.lon)) {
+                    if (!g_waterSampleActive && navSensorsOk &&
+                        ctx->nav->hasWaypoints() &&
+                        !ctx->nav->missionComplete()) {
+                        const int indexBefore = ctx->nav->index();
+                        const int skipped = ctx->nav->skipReached(
+                            fix.lat, fix.lon,
+                             GRID_LOS_LOOKAHEAD_M, WAYPOINT_RADIUS_M,
+                            LOS_PASS_MARGIN_M);
+                        if (skipped > 0) {
                             ctx->heading->reset();
+                            haveLastLosTarget = false;
                         }
-                        lastLosTarget = tgt;
-                        haveLastLosTarget = true;
+                        if (WaterSamplePolicy::crossedBoundary(
+                                indexBefore, ctx->nav->index(),
+                                ctx->nav->count(),
+                                WATER_SAMPLE_EVERY_N_WAYPOINTS)) {
+                            g_waterSampleActive = true;
+                            g_waterSampleStartMs = millis();
+                            g_phQuietSum = 0.0f;
+                            g_phQuietCount = 0;
+                            lastPh = NAN;
+                            logWaterSamplePhase = 1;
+                            logWaterSampleMs = 0;
+                            Serial.printf(
+                                "[USV] water sample hold wp=%d settle=%lums measure=%lums\n",
+                                ctx->nav->index(),
+                                (unsigned long)WATER_SAMPLE_SETTLE_MS,
+                                (unsigned long)WATER_SAMPLE_MEASURE_MS);
+                        }
 
-                        float herr = HeadingController::computeHeadingError(
-                            los.bearingDeg, heading);
-                        int base = chooseBasePwm(herr, los.distToEndM, MOTOR_CRUISE_PWM);
-                        ctx->heading->calculateThrusterOutputs(
-                            los.bearingDeg, heading, base, dt, leftPwm, rightPwm);
+                        if (!g_waterSampleActive) {
+                            LosGuidance los = ctx->nav->computeLos(
+                                fix.lat, fix.lon,
+                                 GRID_LOS_LOOKAHEAD_M, WAYPOINT_RADIUS_M,
+                                LOS_PASS_MARGIN_M);
+
+                            if (los.valid && !ctx->nav->missionComplete()) {
+                                Waypoint tgt = ctx->nav->currentTarget();
+                                logTargetLat = tgt.lat;
+                                logTargetLon = tgt.lon;
+                                logNavBearing = los.bearingDeg;
+                                logCrossTrack = los.crossTrackM;
+                                logDistToTarget = los.distToEndM;
+                                if (haveLastLosTarget &&
+                                    (tgt.lat != lastLosTarget.lat ||
+                                     tgt.lon != lastLosTarget.lon)) {
+                                    ctx->heading->reset();
+                                }
+                                lastLosTarget = tgt;
+                                haveLastLosTarget = true;
+
+                                float herr = HeadingController::computeHeadingError(
+                                    los.bearingDeg, heading);
+                                int base = chooseBasePwm(
+                                    herr, los.distToEndM, MOTOR_CRUISE_PWM);
+                                logHeadingError = herr;
+                                logBasePwm = base;
+                                ctx->heading->calculateThrusterOutputs(
+                                    los.bearingDeg, heading, base, dt,
+                                    leftPwm, rightPwm);
+                                driveSource = DriveSource::GRID;
+                                driveRequestValid = true;
+                            }
+                        }
                     }
                 }
-                ctx->motor->writeThrust(leftPwm, rightPwm);
                 break;
             }
 
@@ -636,8 +942,9 @@ void navigationTask(void* pv) {
                         g_spiralStart.lon = fix.lon;
                         g_spiralInitialized = true;
                         g_haveSpiralTgt = false;
+                        g_spiralEnterMs = millis();
+                        g_spiralPointMs = g_spiralEnterMs;
                     } else {
-                        ctx->motor->stop();
                         break;
                     }
                 }
@@ -648,6 +955,7 @@ void navigationTask(void* pv) {
                         spiralDone = true;
                     } else {
                         ctx->heading->reset();
+                        g_spiralPointMs = millis();
                     }
                 }
 
@@ -658,14 +966,23 @@ void navigationTask(void* pv) {
                         LOS_PASS_MARGIN_M);
 
                     const bool reachedWithProgress =
-                        los.reached && (los.alongTrackM >= 0.5f);
-                    if (los.valid && (reachedWithProgress || los.passed)) {
+                        los.valid && los.reached && (los.alongTrackM >= 0.5f);
+                    const bool passedEnd = los.valid && los.passed;
+                    const bool pointTimeout =
+                        (millis() - g_spiralPointMs) >= SPIRAL_POINT_TIMEOUT_MS;
+                    if (reachedWithProgress || passedEnd || pointTimeout) {
+                        if (pointTimeout && !(reachedWithProgress || passedEnd)) {
+                            Serial.printf("[USV] spiral skip timeout d=%.1fm\n",
+                                          los.valid ? (double)los.distToEndM : NAN);
+                        } else {
+                            Serial.printf("[USV] spiral hit d=%.1fm along=%.1f\n",
+                                          los.distToEndM, los.alongTrackM);
+                        }
                         g_spiralStart = g_spiralTgt;
                         g_haveSpiralTgt = ctx->spiralPlanner->nextSpiralPoint(g_spiralTgt);
                         ctx->heading->reset();
                         haveLastLosTarget = false;
-                        Serial.printf("[USV] spiral hit d=%.1fm along=%.1f\n",
-                                      los.distToEndM, los.alongTrackM);
+                        g_spiralPointMs = millis();
                         if (!g_haveSpiralTgt) {
                             spiralDone = true;
                         } else {
@@ -677,15 +994,23 @@ void navigationTask(void* pv) {
                     }
 
                     if (g_haveSpiralTgt && los.valid) {
+                        logTargetLat = g_spiralTgt.lat;
+                        logTargetLon = g_spiralTgt.lon;
+                        logNavBearing = los.bearingDeg;
+                        logCrossTrack = los.crossTrackM;
+                        logDistToTarget = los.distToEndM;
                         float herr = HeadingController::computeHeadingError(
                             los.bearingDeg, heading);
                         int base = chooseBasePwm(
                             herr, los.distToEndM, MOTOR_APPROACH_PWM);
+                        logHeadingError = herr;
+                        logBasePwm = base;
                         ctx->heading->calculateThrusterOutputs(
                             los.bearingDeg, heading, base, dt, leftPwm, rightPwm);
+                        driveSource = DriveSource::SPIRAL;
+                        driveRequestValid = true;
                     }
                 }
-                ctx->motor->writeThrust(leftPwm, rightPwm);
                 break;
             }
 
@@ -694,33 +1019,66 @@ void navigationTask(void* pv) {
                     const float dist = isfinite(distHomeM) ? distHomeM :
                         (float)Navigator::calculateDistance(
                             fix.lat, fix.lon, g_homeLat, g_homeLon);
+                    const float bearing = (float)Navigator::calculateBearing(
+                        fix.lat, fix.lon, g_homeLat, g_homeLon);
+                    logTargetLat = g_homeLat;
+                    logTargetLon = g_homeLon;
+                    logNavBearing = bearing;
+                    logDistToTarget = dist;
+                    logHeadingError = HeadingController::computeHeadingError(
+                        bearing, heading);
                     // Park on the stored SET_HOME fix. Keep thrusting through
                     // the bubble and the boat overshoots the dock GPS.
                     if (dist <= RTH_ARRIVE_RADIUS_M) {
                         leftPwm = 0;
                         rightPwm = 0;
+                        driveSource = DriveSource::RTH;
+                        driveRequestValid = true;
                     } else {
-                        float bearing = (float)Navigator::calculateBearing(
-                            fix.lat, fix.lon, g_homeLat, g_homeLon);
-                        float herr = HeadingController::computeHeadingError(
-                            bearing, heading);
-                        int base = chooseBasePwm(herr, dist, MOTOR_CRUISE_PWM);
+                        int base = chooseBasePwm(
+                            logHeadingError, dist, MOTOR_CRUISE_PWM);
+                        logBasePwm = base;
                         ctx->heading->calculateThrusterOutputs(
                             bearing, heading, base, dt, leftPwm, rightPwm);
+                        driveSource = DriveSource::RTH;
+                        driveRequestValid = true;
                     }
                 }
-                ctx->motor->writeThrust(leftPwm, rightPwm);
                 break;
             }
         }
 
-        if (gpsTier == GpsLossTier::SAFE_STOP ||
-            gpsTier == GpsLossTier::GPS_FAULT ||
-            !fix.valid ||
-            !compassOk) {
-            ctx->motor->stop();
-            leftPwm = 0;
-            rightPwm = 0;
+        if (fix.valid && isfinite(logTargetLat) && isfinite(logTargetLon)) {
+            logDirectBearing = (float)Navigator::calculateBearing(
+                fix.lat, fix.lon, logTargetLat, logTargetLon);
+        }
+        const int requestedLeftPwm = leftPwm;
+        const int requestedRightPwm = rightPwm;
+        const bool navTurnInPlace = driveRequestValid &&
+            (driveSource == DriveSource::GRID ||
+             driveSource == DriveSource::SPIRAL ||
+             driveSource == DriveSource::RTH) &&
+            (requestedLeftPwm != 0 || requestedRightPwm != 0) &&
+            ctx->heading->isTurningInPlace();
+
+        DriveRequest driveRequest = {
+            driveSource, leftPwm, rightPwm, driveRequestValid
+        };
+        DriveInterlocks driveInterlocks = {
+            state,
+            safety,
+            cmd.emergency || EspNowLink::emergencyPending(),
+            navSensorsOk,
+            state == STATE_GRID_PATROL && !cmd.manualMode &&
+                g_waterSampleActive
+        };
+        const DriveDecision driveDecision =
+            driveController.resolve(driveRequest, driveInterlocks, dt);
+        leftPwm = driveDecision.leftPwm;
+        rightPwm = driveDecision.rightPwm;
+        ctx->motor->writeThrust(leftPwm, rightPwm);
+        if (driveDecision.stopReason != DriveStopReason::NONE) {
+            ctx->heading->reset();
         }
 
         const int absL = leftPwm < 0 ? -leftPwm : leftPwm;
@@ -731,19 +1089,57 @@ void navigationTask(void* pv) {
             hadHardThrust = true;
         }
 
-        TelemetryPacket logRec;
+        // The hold can end later in this tick than the sensor read above.
+        // Never publish the previous quiet sample after thrust resumes, nor
+        // while a manual command is moving the boat through a sample window.
+        if (logWaterSamplePhase != 2 || leftPwm != 0 || rightPwm != 0) {
+            lastPh = NAN;
+        }
+
+        SdLogRecord logRec;
         memset(&logRec, 0, sizeof(logRec));
+        logRec.target_lat = NAN;
+        logRec.target_lon = NAN;
+        logRec.nav_bearing_deg = NAN;
+        logRec.cross_track_m = NAN;
+        logRec.dist_to_target_m = NAN;
+        logRec.heading_error_deg = NAN;
+        logRec.gps_raw_lat = rawGpsLat;
+        logRec.gps_raw_lon = rawGpsLon;
+        logRec.gps_course_deg = gpsCourseDeg;
+        logRec.gps_location_age_ms = gpsLocationAgeMs;
+        logRec.gps_fix_valid = fix.valid ? 1 : 0;
+        logRec.compass_fresh = ctx->compass->isFresh() ? 1 : 0;
+        logRec.compass_fail_count = ctx->compass->failCount();
+        logRec.direct_bearing_deg = logDirectBearing;
+        logRec.requested_left_pwm = (int16_t)requestedLeftPwm;
+        logRec.requested_right_pwm = (int16_t)requestedRightPwm;
+        logRec.turn_in_place = navTurnInPlace ? 1 : 0;
+        logRec.drive_source = (uint8_t)driveSource;
+        logRec.drive_stop_reason = (uint8_t)driveDecision.stopReason;
+        logRec.radio_tx_paused = ctx->radioTxPaused ? 1 : 0;
+        logRec.battery_voltage = battV;
         bool snapshotPublished = false;
         if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             ctx->snapshot.gps_lat         = fix.valid ? fix.lat : NAN;
             ctx->snapshot.gps_lon         = fix.valid ? fix.lon : NAN;
-            ctx->snapshot.water_ph        = phR.valid ? phR.value : NAN;
-            ctx->snapshot.water_turbidity = turbR.valid ? turbR.value : NAN;
-            ctx->snapshot.water_temp      = ctx->water->tempValid() ? temp : NAN;
+            // Mode 0: nan so dock samples stay off the heatmap. pH is only
+            // published as the running quiet-window mean; NTU/temp retain the
+            // latest valid value across a brief sensor glitch.
+            if (state == STATE_STANDBY) {
+                ctx->snapshot.water_ph        = NAN;
+                ctx->snapshot.water_turbidity = NAN;
+                ctx->snapshot.water_temp      = NAN;
+            } else {
+                ctx->snapshot.water_ph        = lastPh;
+                ctx->snapshot.water_turbidity = lastNtu;
+                ctx->snapshot.water_temp      = lastTemp;
+            }
             ctx->snapshot.current_mode    = (uint8_t)state;
             ctx->snapshot.battery_percent = ctx->battery->getBatteryPercent();
             ctx->snapshot.heading_angle   = compassOk ? heading : NAN;
             ctx->batteryVoltage            = battV;
+            ctx->phVoltage                 = ctx->water->lastPhVoltage();
             ctx->turbVoltage               = ctx->water->lastTurbVoltage();
             ctx->compassAddr               = ctx->compass->i2cAddress();
             ctx->compassFailCount          = ctx->compass->failCount();
@@ -754,10 +1150,59 @@ void navigationTask(void* pv) {
             ctx->compassCalRun             = ctx->compass->isCalibrating() ? 1 : 0;
             ctx->homeDistM                 = distHomeM;
             ctx->homeSetFlag               = g_homeSet ? 1 : 0;
-            logRec = ctx->snapshot;
-            logRec.sequence_number = ++logSequence;
+            logRec.boot_ms            = millis();
+            logRec.sequence_number    = ++logSequence;
+            logRec.gps_lat            = ctx->snapshot.gps_lat;
+            logRec.gps_lon            = ctx->snapshot.gps_lon;
+            logRec.water_ph           = ctx->snapshot.water_ph;
+            logRec.water_turbidity    = ctx->snapshot.water_turbidity;
+            logRec.water_temp         = ctx->snapshot.water_temp;
+            logRec.ph_voltage         = ctx->phVoltage;
+            logRec.turb_voltage       = ctx->turbVoltage;
+            logRec.heading_angle      = ctx->snapshot.heading_angle;
+            logRec.current_mode       = ctx->snapshot.current_mode;
+            logRec.battery_percent    = ctx->snapshot.battery_percent;
+            logRec.gps_hdop           = fix.hdop;
+            logRec.gps_sats           = fix.sats;
+            logRec.gps_speed_kmh      = fix.speedKmh;
+            logRec.waypoint_index     = (uint8_t)ctx->nav->index();
+            logRec.waypoint_count     = (uint8_t)ctx->nav->count();
+            logRec.target_lat         = logTargetLat;
+            logRec.target_lon         = logTargetLon;
+            logRec.nav_bearing_deg    = logNavBearing;
+            logRec.cross_track_m      = logCrossTrack;
+            logRec.dist_to_target_m   = logDistToTarget;
+            logRec.heading_error_deg  = logHeadingError;
+            logRec.water_sample_phase = logWaterSamplePhase;
+            logRec.water_sample_ms    = logWaterSampleMs;
+            logRec.base_pwm           = (int16_t)logBasePwm;
+            logRec.left_pwm           = (int16_t)leftPwm;
+            logRec.right_pwm          = (int16_t)rightPwm;
+            logRec.compass_raw_x      = ctx->compassRawX;
+            logRec.compass_raw_y      = ctx->compassRawY;
+            logRec.compass_cal_nvs    = ctx->compassNvs;
+            logRec.telemetry_tx_seq   = ctx->telemetryTxSeq;
+            logRec.telemetry_tx_ms    = ctx->telemetryTxMs;
+            logRec.telemetry_tx_lat   = ctx->telemetryTxLat;
+            logRec.telemetry_tx_lon   = ctx->telemetryTxLon;
+            logRec.telemetry_tx_ph    = ctx->telemetryTxPh;
+            logRec.telemetry_radio_status = ctx->telemetryRadioStatus;
+            logRec.telemetry_tx_attempts  = ctx->telemetryTxAttempts;
             snapshotPublished = true;
             xSemaphoreGive(ctx->stateMutex);
+        }
+
+        if (snapshotPublished) {
+            const GpsDateTime utc = ctx->gps->utcNow();
+            if (utc.valid) {
+                logRec.utc_year   = utc.year;
+                logRec.utc_month  = utc.month;
+                logRec.utc_day    = utc.day;
+                logRec.utc_hour   = utc.hour;
+                logRec.utc_minute = utc.minute;
+                logRec.utc_second = utc.second;
+                logRec.utc_valid  = 1;
+            }
         }
 
         if (snapshotPublished && ctx->logger &&
@@ -922,33 +1367,39 @@ void ioTask(void* pv) {
             millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
             lastTelemetry = millis();
             TelemetryPacket tp;
+            float phV = NAN;
             float turbV = NAN;
+            float tC = NAN;
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 tp = ctx->snapshot;
+                phV = ctx->phVoltage;
                 turbV = ctx->turbVoltage;
+                tC = tp.water_temp;
                 xSemaphoreGive(ctx->stateMutex);
-                if (!radioSendsWaterQuality(tp.current_mode)) {
-                    tp.water_ph = NAN;
-                    tp.water_turbidity = NAN;
-                    tp.water_temp = NAN;
-                }
                 const bool ok = ctx->link->sendTelemetry(tp);
-                if (ok) {
-                    if (xSemaphoreTake(ctx->stateMutex,
-                                       pdMS_TO_TICKS(5)) == pdTRUE) {
+                const EspNowLink::TxDiag txDiag = EspNowLink::lastTx;
+                if (xSemaphoreTake(ctx->stateMutex, portMAX_DELAY) == pdTRUE) {
+                    ctx->telemetryTxSeq = tp.sequence_number;
+                    ctx->telemetryTxMs = millis();
+                    ctx->telemetryTxLat = tp.gps_lat;
+                    ctx->telemetryTxLon = tp.gps_lon;
+                    ctx->telemetryTxPh = tp.water_ph;
+                    ctx->telemetryRadioStatus = radioStatusForLog(txDiag.result);
+                    ctx->telemetryTxAttempts = txDiag.attemptsUsed;
+                    if (ok) {
                         ctx->snapshot.sequence_number = tp.sequence_number;
-                        xSemaphoreGive(ctx->stateMutex);
                     }
+                    xSemaphoreGive(ctx->stateMutex);
                 }
 #if RADIO_TRACE
                 Serial.printf(
                     "[TX] TEL %s seq=%lu lat=%.6f lon=%.6f ph=%.2f ntu=%.1f "
-                    "turbV=%.3f t=%.1f mode=%u batt=%u hdg=%.1f %s\n",
+                    "phV=%.3f turbV=%.3f t=%.1f mode=%u batt=%u hdg=%.1f %s\n",
                     ok ? "ok" : "FAIL",
                     (unsigned long)tp.sequence_number,
                     tp.gps_lat, tp.gps_lon,
                     tp.water_ph, tp.water_turbidity,
-                    turbV, tp.water_temp,
+                    phV, turbV, tC,
                     (unsigned)tp.current_mode,
                     (unsigned)tp.battery_percent,
                     tp.heading_angle,
@@ -984,7 +1435,7 @@ void ioTask(void* pv) {
             }
         }
 
-        TelemetryPacket logRec;
+        SdLogRecord logRec;
         while (xQueueReceive(ctx->logQueue, &logRec, 0) == pdTRUE) {
             if (ctx->logger && ctx->logger->isReady()) {
                 if (!ctx->logger->logRecord(logRec)) {

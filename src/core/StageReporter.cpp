@@ -57,7 +57,8 @@ uint8_t StageReporter::deriveNextStage(const StageReportContext& ctx) {
         case STATE_STANDBY:
             return STATE_GRID_PATROL;
         case STATE_GRID_PATROL:
-            if (ctx.fsm.anomalyDetected || ctx.fsm.forceSpiralCommand)
+            if ((ctx.fsm.anomalyDetected || ctx.fsm.forceSpiralCommand) &&
+                ctx.fsm.passedFirstWaypoint)
                 return STATE_SPIRAL_MAPPING;
             if (ctx.fsm.gridComplete) {
                 return ctx.fsm.homeSet ? STATE_RTH : STATE_STANDBY;

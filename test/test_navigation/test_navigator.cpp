@@ -1,4 +1,4 @@
-// Native unit tests: Navigator LOS, FSM, PID, Safety, Spiral
+// Native unit tests: navigation, control, anomaly policy and mission safety
 // Run: pio test -e native
 #include <unity.h>
 #include <math.h>
@@ -7,8 +7,12 @@
 #include "navigation/Navigator.h"
 #include "navigation/SpiralPlanner.h"
 #include "control/PidController.h"
+#include "control/HeadingController.h"
+#include "control/DriveController.h"
 #include "core/MissionFsm.h"
 #include "core/StageReporter.h"
+#include "core/WaterSamplePolicy.h"
+#include "detection/WaterAnomalyMonitor.h"
 #include "safety/SafetyManager.h"
 #include "config.h"
 
@@ -341,6 +345,32 @@ void test_los_cross_track_nonzero(void) {
     TEST_ASSERT_TRUE(fabsf(g.crossTrackM) > 1.0f);
 }
 
+void test_grid_lookahead_softens_lateral_capture(void) {
+    const Waypoint start = {13.7500, 100.5000};
+    Waypoint end;
+    double endLat, endLon;
+    Navigator::fromLocalEnu(start.lat, start.lon, 0.0, 32.0,
+                            endLat, endLon);
+    end = {endLat, endLon};
+    double boatLat, boatLon;
+    Navigator::fromLocalEnu(start.lat, start.lon, 3.0, 5.0,
+                            boatLat, boatLon);
+
+    const LosGuidance oldLos = Navigator::computeSegmentLos(
+        boatLat, boatLon, start, end, LOS_LOOKAHEAD_M,
+        WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M);
+    const LosGuidance gridLos = Navigator::computeSegmentLos(
+        boatLat, boatLon, start, end, GRID_LOS_LOOKAHEAD_M,
+        WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M);
+
+    TEST_ASSERT_TRUE(oldLos.valid && gridLos.valid);
+    const float oldCorrection = fabsf(
+        HeadingController::computeHeadingError(oldLos.bearingDeg, 0.0f));
+    const float gridCorrection = fabsf(
+        HeadingController::computeHeadingError(gridLos.bearingDeg, 0.0f));
+    TEST_ASSERT_TRUE(gridCorrection + 10.0f < oldCorrection);
+}
+
 // ---------------------------------------------------------------------------
 // Spiral
 // ---------------------------------------------------------------------------
@@ -387,6 +417,34 @@ void test_spiral_reaches_three_turns_inside_radius(void) {
     TEST_ASSERT_TRUE(count >= 20);
     TEST_ASSERT_TRUE(maxR <= SPIRAL_MAX_RADIUS_M + 0.5);
     TEST_ASSERT_TRUE(maxR > SPIRAL_MAX_RADIUS_M - 0.2);
+}
+
+void test_skip_reached_does_not_pick_nearest(void) {
+    WaypointArrayPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.packet_index = 0;
+    pkt.waypoint_count = 3;
+    pkt.waypoints[0] = {13.7500, 100.5000};
+    pkt.waypoints[1] = {13.7501, 100.5000}; // ~11 m north
+    pkt.waypoints[2] = {13.7502, 100.5000};
+
+    Navigator nav;
+    TEST_ASSERT_TRUE(nav.loadWaypoints(pkt));
+    nav.setMissionOrigin(13.7500, 100.5000);
+    nav.advanceWaypoint(); // targeting WP1
+    TEST_ASSERT_EQUAL(1, nav.index());
+
+    // Sitting on WP1 (as at spiral enter) must skip it, not snap to WP2 by nearest.
+    int skipped = nav.skipReached(
+        13.7501, 100.5000, GRID_LOS_LOOKAHEAD_M, WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M);
+    TEST_ASSERT_EQUAL(1, skipped);
+    TEST_ASSERT_EQUAL(2, nav.index());
+
+    // Far from WP2: do not jump; still that target.
+    skipped = nav.skipReached(
+        13.7501, 100.5000, GRID_LOS_LOOKAHEAD_M, WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M);
+    TEST_ASSERT_EQUAL(0, skipped);
+    TEST_ASSERT_EQUAL(2, nav.index());
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +499,7 @@ static FsmInputs baseInputs() {
     in.gpsOk = true;
     in.compassOk = true;
     in.hasWaypoints = true;
+    in.passedFirstWaypoint = true;
     in.homeSet = true;
     in.safety = SafetyState::NORMAL;
     return in;
@@ -589,7 +648,7 @@ void test_rth_arrive_rejected_if_never_left_or_started_inside(void) {
         true, true, true, 0.5f, 15.0f, inside, 2000));
     inside = 4000;
     TEST_ASSERT_FALSE(MissionFsm::isArrivedHome(
-        true, true, true, 1.5f, 15.0f, inside, 50));
+        true, true, true, RTH_ARRIVE_RADIUS_M + 0.5f, 15.0f, inside, 50));
     TEST_ASSERT_EQUAL_UINT32(0, inside);
 }
 
@@ -699,6 +758,220 @@ void test_fsm_force_spiral_from_grid(void) {
     TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
 }
 
+void test_grid_radius_does_not_skip_a_short_connector_at_its_start(void) {
+    const Waypoint start = {13.7500, 100.5000};
+    WaypointArrayPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.packet_index = 0;
+    pkt.waypoint_count = 3;
+    pkt.waypoints[0] = start;
+    double targetLat, targetLon;
+    Navigator::fromLocalEnu(start.lat, start.lon, 2.5, 0.0,
+                            targetLat, targetLon);
+    pkt.waypoints[1] = {targetLat, targetLon};
+    Navigator::fromLocalEnu(start.lat, start.lon, 4.0, 0.0,
+                            targetLat, targetLon);
+    pkt.waypoints[2] = {targetLat, targetLon};
+
+    Navigator nav;
+    TEST_ASSERT_TRUE(nav.loadWaypoints(pkt));
+    nav.setMissionOrigin(start.lat, start.lon);
+    nav.advanceWaypoint(); // The next connector is shorter than the 3 m ball.
+    TEST_ASSERT_TRUE(nav.isWaypointReached(start.lat, start.lon,
+                                           WAYPOINT_RADIUS_M));
+    TEST_ASSERT_EQUAL(0, nav.skipReached(
+        start.lat, start.lon, GRID_LOS_LOOKAHEAD_M,
+        WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M));
+
+    double boatLat, boatLon;
+    Navigator::fromLocalEnu(start.lat, start.lon, 2.0, 0.0,
+                            boatLat, boatLon);
+    TEST_ASSERT_EQUAL(1, nav.skipReached(
+        boatLat, boatLon, GRID_LOS_LOOKAHEAD_M,
+        WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M));
+    TEST_ASSERT_EQUAL(2, nav.index());
+    TEST_ASSERT_EQUAL(0, nav.skipReached(
+        boatLat, boatLon, GRID_LOS_LOOKAHEAD_M,
+        WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M));
+}
+
+void test_grid_pass_must_stay_near_segment(void) {
+    const Waypoint start = {13.7500, 100.5000};
+    WaypointArrayPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.packet_index = 0;
+    pkt.waypoint_count = 2;
+    pkt.waypoints[0] = start;
+    double targetLat, targetLon;
+    Navigator::fromLocalEnu(start.lat, start.lon, 0.0, 10.0,
+                            targetLat, targetLon);
+    pkt.waypoints[1] = {targetLat, targetLon};
+
+    Navigator nav;
+    TEST_ASSERT_TRUE(nav.loadWaypoints(pkt));
+    nav.setMissionOrigin(start.lat, start.lon);
+    nav.advanceWaypoint();
+
+    double boatLat, boatLon;
+    Navigator::fromLocalEnu(start.lat, start.lon, 4.0, 12.0,
+                            boatLat, boatLon);
+    const LosGuidance farPass = nav.computeLos(
+        boatLat, boatLon, GRID_LOS_LOOKAHEAD_M,
+        WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M);
+    TEST_ASSERT_TRUE(farPass.passed);
+    TEST_ASSERT_FALSE(farPass.reached);
+    TEST_ASSERT_EQUAL(0, nav.skipReached(
+        boatLat, boatLon, GRID_LOS_LOOKAHEAD_M,
+        WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M));
+
+    Navigator::fromLocalEnu(start.lat, start.lon, 2.8, 12.0,
+                            boatLat, boatLon);
+    const LosGuidance nearPass = nav.computeLos(
+        boatLat, boatLon, GRID_LOS_LOOKAHEAD_M,
+        WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M);
+    TEST_ASSERT_TRUE(nearPass.passed);
+    TEST_ASSERT_FALSE(nearPass.reached);
+    TEST_ASSERT_EQUAL(1, nav.skipReached(
+        boatLat, boatLon, GRID_LOS_LOOKAHEAD_M,
+        WAYPOINT_RADIUS_M, LOS_PASS_MARGIN_M));
+}
+
+void test_fsm_repeated_force_spiral_waits_for_cooldown(void) {
+    MissionFsm fsm;
+    fsm.begin();
+    FsmInputs in = baseInputs();
+    in.nowMs = 1000;
+    in.startCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.startCommand = false;
+
+    in.forceSpiralCommand = true;
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, fsm.tick(in));
+    in.forceSpiralCommand = false;
+    in.nowMs = 241000;
+    in.spiralAborted = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.spiralAborted = false;
+    TEST_ASSERT_TRUE(fsm.forceSpiralCooldownActive(in.nowMs));
+
+    in.forceSpiralCommand = true;  // delayed duplicate from the gateway
+    in.nowMs = 244000;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.nowMs = 241000 + FORCE_SPIRAL_COOLDOWN_MS - 1;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.nowMs++;
+    TEST_ASSERT_FALSE(fsm.forceSpiralCooldownActive(in.nowMs));
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, fsm.tick(in));
+}
+
+void test_fsm_force_spiral_cooldown_keeps_safety_and_auto_priority(void) {
+    MissionFsm fsm;
+    fsm.begin();
+    FsmInputs in = baseInputs();
+    in.startCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.startCommand = false;
+    in.forceSpiralCommand = true;
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, fsm.tick(in));
+
+    in.forceSpiralCommand = false;
+    in.nowMs = 10000;
+    in.emergencyCommand = true;
+    TEST_ASSERT_EQUAL(STATE_EMERGENCY_STOP, fsm.tick(in));
+    TEST_ASSERT_TRUE(fsm.forceSpiralCooldownActive(in.nowMs));
+    in.emergencyCommand = false;
+    in.clearEstop = true;
+    TEST_ASSERT_EQUAL(STATE_STANDBY, fsm.tick(in));
+    in.clearEstop = false;
+    in.startCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.startCommand = false;
+
+    in.forceSpiralCommand = true;
+    in.nowMs = 13000;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.forceRthCommand = true;
+    TEST_ASSERT_EQUAL(STATE_RTH, fsm.tick(in));
+
+    MissionFsm autoFsm;
+    autoFsm.begin();
+    in = baseInputs();
+    in.startCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, autoFsm.tick(in));
+    in.startCommand = false;
+    in.forceSpiralCommand = true;
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, autoFsm.tick(in));
+    in.forceSpiralCommand = false;
+    in.nowMs = 10000;
+    in.spiralComplete = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, autoFsm.tick(in));
+    in.spiralComplete = false;
+    in.anomalyDetected = true;
+    in.forceSpiralCommand = true;
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, autoFsm.tick(in));
+}
+
+void test_fsm_force_spiral_cooldown_handles_millis_wrap(void) {
+    MissionFsm fsm;
+    fsm.begin();
+    FsmInputs in = baseInputs();
+    in.startCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.startCommand = false;
+    in.forceSpiralCommand = true;
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, fsm.tick(in));
+    in.forceSpiralCommand = false;
+    in.nowMs = UINT32_MAX - 1000U;
+    in.spiralComplete = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.spiralComplete = false;
+    in.nowMs = 1000U;
+    TEST_ASSERT_TRUE(fsm.forceSpiralCooldownActive(in.nowMs));
+    in.forceSpiralCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.nowMs = (uint32_t)((UINT32_MAX - 1000U) + FORCE_SPIRAL_COOLDOWN_MS);
+    TEST_ASSERT_FALSE(fsm.forceSpiralCooldownActive(in.nowMs));
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, fsm.tick(in));
+}
+
+void test_fsm_spiral_abort_returns_to_grid(void) {
+    MissionFsm fsm;
+    fsm.begin();
+    FsmInputs in = baseInputs();
+    in.startCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.startCommand = false;
+
+    in.anomalyDetected = true;
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, fsm.tick(in));
+    in.anomalyDetected = false;
+
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, fsm.tick(in));
+
+    in.spiralAborted = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.spiralAborted = false;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+}
+
+void test_fsm_spiral_blocked_before_first_waypoint(void) {
+    MissionFsm fsm;
+    fsm.begin();
+    FsmInputs in = baseInputs();
+    in.passedFirstWaypoint = false;
+    in.startCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.startCommand = false;
+
+    in.anomalyDetected = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+    in.forceSpiralCommand = true;
+    TEST_ASSERT_EQUAL(STATE_GRID_PATROL, fsm.tick(in));
+
+    in.passedFirstWaypoint = true;
+    TEST_ASSERT_EQUAL(STATE_SPIRAL_MAPPING, fsm.tick(in));
+}
+
 void test_fsm_force_spiral_ignored_in_standby(void) {
     MissionFsm fsm;
     fsm.begin();
@@ -727,6 +1000,336 @@ void test_fsm_start_blocked_on_low_battery(void) {
     in.startCommand = true;
     in.safety = SafetyState::LOW_BATTERY_RTH;
     TEST_ASSERT_EQUAL(STATE_STANDBY, fsm.tick(in));
+}
+
+void test_home_capture_mean_and_spread(void) {
+    MissionFsm::HomeCapture cap;
+    MissionFsm::homeCaptureReset(cap);
+    TEST_ASSERT_EQUAL_UINT16(0, cap.count);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f, MissionFsm::homeCaptureSpreadM(cap));
+
+    MissionFsm::homeCaptureAdd(cap, 20.04750, 99.89100);
+    double lat = 0.0, lon = 0.0;
+    TEST_ASSERT_TRUE(MissionFsm::homeCaptureMean(cap, lat, lon));
+    TEST_ASSERT_FLOAT_WITHIN(0.00001f, 20.04750f, (float)lat);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f, MissionFsm::homeCaptureSpreadM(cap));
+
+    // ~5.6 m north — typical stationary wander; must still accept under 8 m.
+    MissionFsm::homeCaptureAdd(cap, 20.04755, 99.89100);
+    TEST_ASSERT_TRUE(MissionFsm::homeCaptureSpreadM(cap) > 4.0f);
+    TEST_ASSERT_TRUE(MissionFsm::homeCaptureSpreadM(cap) < SET_HOME_MAX_SPREAD_M);
+    TEST_ASSERT_TRUE(MissionFsm::homeCaptureMean(cap, lat, lon));
+    TEST_ASSERT_FLOAT_WITHIN(0.00002f, 20.047525f, (float)lat);
+
+    MissionFsm::homeCaptureAdd(cap, 20.04770, 99.89100);
+    TEST_ASSERT_TRUE(MissionFsm::homeCaptureSpreadM(cap) > SET_HOME_MAX_SPREAD_M);
+}
+
+void test_heading_forward_mode_never_reverses_a_thruster(void) {
+    HeadingController heading(10.0f, 0.0f, 0.0f);
+    int left = 0, right = 0;
+    heading.calculateThrusterOutputs(29.0f, 0.0f, 130, 0.05f, left, right);
+    TEST_ASSERT_TRUE(left >= 0);
+    TEST_ASSERT_TRUE(right >= 0);
+    TEST_ASSERT_EQUAL(MOTOR_PWM_LIMIT, left);
+    TEST_ASSERT_EQUAL(0, right);
+}
+
+void test_heading_turn_mode_has_hysteresis(void) {
+    HeadingController heading(4.0f, 0.0f, 0.0f);
+    int left = 0, right = 0;
+
+    heading.calculateThrusterOutputs(35.0f, 0.0f, 0, 0.05f, left, right);
+    TEST_ASSERT_TRUE(left > 0);
+    TEST_ASSERT_TRUE(right < 0);
+    TEST_ASSERT_TRUE(heading.isTurningInPlace());
+
+    // Below the 30-degree entry threshold but above the 20-degree exit:
+    // remain in pivot instead of switching modes on every noisy fix.
+    heading.calculateThrusterOutputs(25.0f, 0.0f, 130, 0.05f, left, right);
+    TEST_ASSERT_TRUE(left > 0);
+    TEST_ASSERT_TRUE(right < 0);
+    TEST_ASSERT_TRUE(heading.isTurningInPlace());
+
+    heading.calculateThrusterOutputs(19.0f, 0.0f, 130, 0.05f, left, right);
+    TEST_ASSERT_TRUE(left >= 0);
+    TEST_ASSERT_TRUE(right >= 0);
+    TEST_ASSERT_FALSE(heading.isTurningInPlace());
+}
+
+void test_heading_reset_clears_turn_hysteresis(void) {
+    HeadingController heading(4.0f, 0.0f, 0.0f);
+    int left = 0, right = 0;
+    heading.calculateThrusterOutputs(35.0f, 0.0f, 0, 0.05f, left, right);
+    TEST_ASSERT_TRUE(right < 0);
+
+    heading.reset();
+    heading.calculateThrusterOutputs(25.0f, 0.0f, 130, 0.05f, left, right);
+    TEST_ASSERT_TRUE(left >= 0);
+    TEST_ASSERT_TRUE(right >= 0);
+}
+
+static DriveInterlocks normalDriveInterlocks(BoatState state) {
+    DriveInterlocks in = {};
+    in.state = state;
+    in.safety = SafetyState::NORMAL;
+    in.navigationAvailable = true;
+    return in;
+}
+
+void test_drive_controller_slews_nonzero_requests(void) {
+    DriveController drive(178, 80, 600.0f);
+    DriveRequest req = {DriveSource::GRID, 130, 130, true};
+    DriveInterlocks in = normalDriveInterlocks(STATE_GRID_PATROL);
+
+    DriveDecision out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(80, out.leftPwm);
+    TEST_ASSERT_EQUAL(80, out.rightPwm);
+    out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(110, out.leftPwm);
+    TEST_ASSERT_EQUAL(110, out.rightPwm);
+}
+
+void test_drive_controller_stops_immediately_for_every_interlock(void) {
+    DriveController drive(178, 80, 600.0f);
+    DriveRequest req = {DriveSource::GRID, 130, 100, true};
+    DriveInterlocks in = normalDriveInterlocks(STATE_GRID_PATROL);
+    (void)drive.resolve(req, in, 0.20f);
+
+    in.waterSampleHold = true;
+    DriveDecision out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(0, out.leftPwm);
+    TEST_ASSERT_EQUAL(0, out.rightPwm);
+    TEST_ASSERT_EQUAL((int)DriveStopReason::WATER_SAMPLE,
+                      (int)out.stopReason);
+
+    in.waterSampleHold = false;
+    (void)drive.resolve(req, in, 0.20f);
+    in.emergencyPending = true;
+    out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(0, out.leftPwm);
+    TEST_ASSERT_EQUAL(0, out.rightPwm);
+    TEST_ASSERT_EQUAL((int)DriveStopReason::HARD_STOP,
+                      (int)out.stopReason);
+
+    in.emergencyPending = false;
+    in.navigationAvailable = false;
+    out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(0, out.leftPwm);
+    TEST_ASSERT_EQUAL(0, out.rightPwm);
+    TEST_ASSERT_EQUAL((int)DriveStopReason::NAVIGATION_UNAVAILABLE,
+                      (int)out.stopReason);
+}
+
+void test_drive_controller_rejects_source_state_mismatch(void) {
+    DriveController drive(178, 80, 0.0f);
+    DriveRequest req = {DriveSource::RTH, 120, 120, true};
+    DriveInterlocks in = normalDriveInterlocks(STATE_GRID_PATROL);
+    DriveDecision out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(0, out.leftPwm);
+    TEST_ASSERT_EQUAL((int)DriveStopReason::INVALID_REQUEST,
+                      (int)out.stopReason);
+}
+
+void test_drive_controller_allows_low_battery_rth(void) {
+    DriveController drive(178, 80, 600.0f);
+    DriveRequest req = {DriveSource::RTH, 110, 110, true};
+    DriveInterlocks in = normalDriveInterlocks(STATE_RTH);
+    in.safety = SafetyState::LOW_BATTERY_RTH;
+    DriveDecision out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(80, out.leftPwm);
+    TEST_ASSERT_EQUAL(80, out.rightPwm);
+}
+
+void test_drive_controller_never_outputs_sub_deadband_pwm(void) {
+    DriveController drive(178, 80, 600.0f);
+    DriveInterlocks in = normalDriveInterlocks(STATE_GRID_PATROL);
+    DriveRequest req = {DriveSource::GRID, 130, 130, true};
+    for (int i = 0; i < 4; ++i) {
+        const DriveDecision out = drive.resolve(req, in, 0.05f);
+        TEST_ASSERT_TRUE(out.leftPwm == 0 || abs(out.leftPwm) >= 80);
+        TEST_ASSERT_TRUE(out.rightPwm == 0 || abs(out.rightPwm) >= 80);
+    }
+}
+
+void test_drive_controller_direction_change_passes_through_neutral(void) {
+    DriveController drive(178, 80, 600.0f);
+    DriveInterlocks in = normalDriveInterlocks(STATE_GRID_PATROL);
+    DriveRequest req = {DriveSource::GRID, 130, 130, true};
+    for (int i = 0; i < 3; ++i) (void)drive.resolve(req, in, 0.05f);
+
+    req.leftPwm = -130;
+    req.rightPwm = -130;
+    DriveDecision out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(100, out.leftPwm);
+    out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(0, out.leftPwm);
+    out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(-80, out.leftPwm);
+}
+
+void test_drive_controller_source_change_forces_neutral_tick(void) {
+    DriveController drive(178, 80, 600.0f);
+    DriveInterlocks in = normalDriveInterlocks(STATE_GRID_PATROL);
+    DriveRequest req = {DriveSource::MANUAL, -130, -130, true};
+    (void)drive.resolve(req, in, 0.05f);
+
+    req = {DriveSource::GRID, 130, 130, true};
+    DriveDecision out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(0, out.leftPwm);
+    TEST_ASSERT_EQUAL(0, out.rightPwm);
+    TEST_ASSERT_EQUAL((int)DriveStopReason::SOURCE_CHANGE,
+                      (int)out.stopReason);
+    out = drive.resolve(req, in, 0.05f);
+    TEST_ASSERT_EQUAL(80, out.leftPwm);
+    TEST_ASSERT_EQUAL(80, out.rightPwm);
+}
+
+void test_turbidity_strong_trigger_requires_full_average(void) {
+    WaterAnomalyMonitor monitor;
+    uint32_t now = 0;
+    for (int i = 0; i < 7; ++i) {
+        TEST_ASSERT_FALSE(monitor.updateTurbidity(60.0f, false, now));
+        now += 250;
+    }
+    TEST_ASSERT_TRUE(monitor.updateTurbidity(60.0f, false, now));
+}
+
+void test_turbidity_baseline_dwell_triggers_below_strong_level(void) {
+    WaterAnomalyMonitor monitor;
+    uint32_t now = 0;
+    for (int i = 0; i < 8; ++i) {
+        TEST_ASSERT_FALSE(monitor.updateTurbidity(5.0f, false, now));
+        now += 250;
+    }
+    bool triggered = false;
+    for (int i = 0; i < 28; ++i) {
+        triggered = monitor.updateTurbidity(30.0f, false, now);
+        now += 250;
+    }
+    TEST_ASSERT_TRUE(triggered);
+}
+
+void test_turbidity_mild_pond_delta_survives_dwell(void) {
+    WaterAnomalyMonitor monitor;
+    uint32_t now = 0;
+    for (int i = 0; i < 16; ++i) {
+        TEST_ASSERT_FALSE(monitor.updateTurbidity(7.8f, false, now));
+        now += 250;
+    }
+    bool triggered = false;
+    for (int i = 0; i < 28; ++i) {
+        triggered = monitor.updateTurbidity(18.5f, false, now);
+        now += 250;
+    }
+    TEST_ASSERT_TRUE(triggered);
+}
+
+void test_turbidity_motion_does_not_hide_strong_average(void) {
+    WaterAnomalyMonitor monitor;
+    uint32_t now = 0;
+    bool triggered = false;
+    for (int i = 0; i < 8; ++i) {
+        triggered = monitor.updateTurbidity(60.0f, true, now);
+        now += 250;
+    }
+    TEST_ASSERT_TRUE(triggered);
+}
+
+void test_turbidity_invalid_sample_preserves_latch(void) {
+    WaterAnomalyMonitor monitor;
+    uint32_t now = 0;
+    for (int i = 0; i < 8; ++i) {
+        (void)monitor.updateTurbidity(60.0f, false, now);
+        now += 250;
+    }
+    TEST_ASSERT_TRUE(monitor.shouldTriggerSpiral());
+    TEST_ASSERT_TRUE(monitor.updateTurbidity(NAN, false, now));
+}
+
+void test_turbidity_stale_gap_resets_partial_strong_average(void) {
+    WaterAnomalyMonitor monitor;
+    uint32_t now = 0;
+    for (int i = 0; i < 7; ++i) {
+        TEST_ASSERT_FALSE(monitor.updateTurbidity(60.0f, false, now));
+        now += 250;
+    }
+    now += ANOMALY_SENSOR_STALE_MS;
+    monitor.notifyTurbidityInvalid(now);
+    now += 250;
+    TEST_ASSERT_FALSE(monitor.updateTurbidity(60.0f, false, now));
+}
+
+void test_turbidity_stale_gap_restarts_baseline_dwell(void) {
+    WaterAnomalyMonitor monitor;
+    uint32_t now = 0;
+    for (int i = 0; i < 8; ++i) {
+        TEST_ASSERT_FALSE(monitor.updateTurbidity(7.8f, false, now));
+        now += 250;
+    }
+    for (int i = 0; i < 12; ++i) {
+        TEST_ASSERT_FALSE(monitor.updateTurbidity(18.5f, false, now));
+        now += 250;
+    }
+    now += ANOMALY_SENSOR_STALE_MS;
+    monitor.notifyTurbidityInvalid(now);
+    now += 250;
+    TEST_ASSERT_FALSE(monitor.updateTurbidity(18.5f, false, now));
+}
+
+void test_turbidity_cooldown_blocks_same_plume(void) {
+    WaterAnomalyMonitor monitor;
+    uint32_t now = 0;
+    for (int i = 0; i < 8; ++i) {
+        (void)monitor.updateTurbidity(60.0f, false, now);
+        now += 250;
+    }
+    TEST_ASSERT_TRUE(monitor.shouldTriggerSpiral());
+    monitor.notifySpiralDone(now);
+    TEST_ASSERT_FALSE(monitor.shouldTriggerSpiral());
+
+    monitor.clearPendingTrigger();
+    for (int i = 0; i < 8; ++i) {
+        TEST_ASSERT_FALSE(monitor.updateTurbidity(60.0f, false, now));
+        now += 250;
+    }
+    now += ANOMALY_COOLDOWN_MS;
+    // The cooldown gap is also a stale-sensor gap, so pending evidence must
+    // be rebuilt from a complete fresh SMA window before another trigger.
+    for (int i = 0; i < 7; ++i) {
+        TEST_ASSERT_FALSE(monitor.updateTurbidity(60.0f, false, now));
+        now += 250;
+    }
+    TEST_ASSERT_TRUE(monitor.updateTurbidity(60.0f, false, now));
+}
+
+void test_water_hold_is_three_seconds_with_ten_measurements(void) {
+    TEST_ASSERT_EQUAL_UINT32(3000UL, WATER_SAMPLE_HOLD_MS);
+    const uint32_t adsPeriod =
+        NAV_LOOP_PERIOD_MS * WATER_ADS_EVERY_N_LOOPS;
+    TEST_ASSERT_EQUAL_UINT32(10UL, WATER_SAMPLE_MEASURE_MS / adsPeriod);
+}
+
+void test_water_sample_boundary_includes_final_waypoint(void) {
+    TEST_ASSERT_TRUE(WaterSamplePolicy::crossedBoundary(3, 4, 4, 4));
+    TEST_ASSERT_TRUE(WaterSamplePolicy::crossedBoundary(7, 8, 8, 4));
+    TEST_ASSERT_FALSE(WaterSamplePolicy::crossedBoundary(2, 3, 4, 4));
+    TEST_ASSERT_FALSE(WaterSamplePolicy::crossedBoundary(4, 5, 8, 4));
+}
+
+void test_grid_completion_waits_for_final_water_sample(void) {
+    TEST_ASSERT_FALSE(
+        WaterSamplePolicy::missionCompleteForFsm(true, true));
+    TEST_ASSERT_TRUE(
+        WaterSamplePolicy::missionCompleteForFsm(true, false));
+    TEST_ASSERT_FALSE(
+        WaterSamplePolicy::missionCompleteForFsm(false, false));
+}
+
+void test_home_capture_window_allows_minimum_samples(void) {
+    const uint32_t minimumSpanMs =
+        (uint32_t)(SET_HOME_MIN_SAMPLES - 1) * SET_HOME_SAMPLE_MS;
+    TEST_ASSERT_TRUE(SET_HOME_DWELL_MS >= minimumSpanMs);
 }
 
 void test_fsm_gps_fault_latches_estop(void) {
@@ -770,13 +1373,38 @@ int main(int, char**) {
     RUN_TEST(test_los_on_track_bearing_east);
     RUN_TEST(test_los_passed_end);
     RUN_TEST(test_los_cross_track_nonzero);
+    RUN_TEST(test_grid_lookahead_softens_lateral_capture);
     RUN_TEST(test_spiral_offset_grows);
     RUN_TEST(test_spiral_offset_wraps_longitude);
     RUN_TEST(test_spiral_accept_radius_below_inner_chord);
     RUN_TEST(test_spiral_first_ring_outside_accept);
     RUN_TEST(test_spiral_reaches_three_turns_inside_radius);
+    RUN_TEST(test_skip_reached_does_not_pick_nearest);
+    RUN_TEST(test_grid_radius_does_not_skip_a_short_connector_at_its_start);
+    RUN_TEST(test_grid_pass_must_stay_near_segment);
     RUN_TEST(test_pid_angular_wrap_no_spike);
     RUN_TEST(test_pid_reset_clears_integral);
+    RUN_TEST(test_heading_forward_mode_never_reverses_a_thruster);
+    RUN_TEST(test_heading_turn_mode_has_hysteresis);
+    RUN_TEST(test_heading_reset_clears_turn_hysteresis);
+    RUN_TEST(test_drive_controller_slews_nonzero_requests);
+    RUN_TEST(test_drive_controller_stops_immediately_for_every_interlock);
+    RUN_TEST(test_drive_controller_rejects_source_state_mismatch);
+    RUN_TEST(test_drive_controller_allows_low_battery_rth);
+    RUN_TEST(test_drive_controller_never_outputs_sub_deadband_pwm);
+    RUN_TEST(test_drive_controller_direction_change_passes_through_neutral);
+    RUN_TEST(test_drive_controller_source_change_forces_neutral_tick);
+    RUN_TEST(test_turbidity_strong_trigger_requires_full_average);
+    RUN_TEST(test_turbidity_baseline_dwell_triggers_below_strong_level);
+    RUN_TEST(test_turbidity_mild_pond_delta_survives_dwell);
+    RUN_TEST(test_turbidity_motion_does_not_hide_strong_average);
+    RUN_TEST(test_turbidity_invalid_sample_preserves_latch);
+    RUN_TEST(test_turbidity_stale_gap_resets_partial_strong_average);
+    RUN_TEST(test_turbidity_stale_gap_restarts_baseline_dwell);
+    RUN_TEST(test_turbidity_cooldown_blocks_same_plume);
+    RUN_TEST(test_water_hold_is_three_seconds_with_ten_measurements);
+    RUN_TEST(test_water_sample_boundary_includes_final_waypoint);
+    RUN_TEST(test_grid_completion_waits_for_final_water_sample);
     RUN_TEST(test_safety_critical_and_rth);
     RUN_TEST(test_stage_reporter_waits_for_complete_upload);
     RUN_TEST(test_stage_reporter_start_waits_for_nav_ready);
@@ -791,9 +1419,16 @@ int main(int, char**) {
     RUN_TEST(test_fsm_force_rth_without_home_is_estop);
     RUN_TEST(test_fsm_start_needs_waypoints);
     RUN_TEST(test_fsm_force_spiral_from_grid);
+    RUN_TEST(test_fsm_repeated_force_spiral_waits_for_cooldown);
+    RUN_TEST(test_fsm_force_spiral_cooldown_keeps_safety_and_auto_priority);
+    RUN_TEST(test_fsm_force_spiral_cooldown_handles_millis_wrap);
+    RUN_TEST(test_fsm_spiral_abort_returns_to_grid);
+    RUN_TEST(test_fsm_spiral_blocked_before_first_waypoint);
     RUN_TEST(test_fsm_force_spiral_ignored_in_standby);
     RUN_TEST(test_fsm_force_rth_wins_over_force_spiral);
     RUN_TEST(test_fsm_start_blocked_on_low_battery);
+    RUN_TEST(test_home_capture_mean_and_spread);
+    RUN_TEST(test_home_capture_window_allows_minimum_samples);
     RUN_TEST(test_fsm_gps_fault_latches_estop);
     return UNITY_END();
 }

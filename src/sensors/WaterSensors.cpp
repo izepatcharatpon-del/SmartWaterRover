@@ -11,6 +11,10 @@ static_assert(TURBIDITY_CLEAR_V > TURBIDITY_DIRTY_V,
               "clear voltage must be higher than dirty");
 static_assert(TURBIDITY_DIRTY_V > TURBIDITY_FAULT_V,
               "dirty voltage must stay above the open-wire floor");
+static_assert(PH_ELECTRODE_V_MAX > PH_CAL_V401,
+              "electrode max must stay above acid cal voltage");
+static_assert(PH_ELECTRODE_V_MIN < PH_CAL_V918,
+              "electrode min must stay below alkali cal voltage");
 
 static const char* PH_NVS_NS    = "usv_ph";
 static const char* PH_NVS_V401  = "v401";
@@ -25,8 +29,10 @@ WaterSensors::WaterSensors()
       _waterTemp(25.0f),
       _tempValid(false),
       _adsReady(false),
+      _lastAdsRetryMs(0),
       _vCap401(NAN), _vCap686(NAN), _vCap918(NAN),
       _cap401(false), _cap686(false), _cap918(false),
+      _lastPhVoltage(NAN),
       _lastTurbVoltage(NAN) {
     resetCalibration();
 }
@@ -43,6 +49,17 @@ bool WaterSensors::begin() {
     _lastTempRequest = millis();
 
     loadCalibration();
+    return _adsReady;
+}
+
+bool WaterSensors::pollAds(unsigned long nowMs) {
+    if (_adsReady) return true;
+    if (nowMs - _lastAdsRetryMs < ADS_RETRY_MS) return false;
+    _lastAdsRetryMs = nowMs;
+    _adsReady = _ads.begin(ADS1115_I2C_ADDR);
+    if (_adsReady) {
+        _ads.setGain(GAIN_TWOTHIRDS);
+    }
     return _adsReady;
 }
 
@@ -216,38 +233,46 @@ float WaterSensors::phFromVoltageCalibrated(float volts, float tempC) const {
 }
 
 WaterReading WaterSensors::readPh(float tempC) {
-    WaterReading r = {7.0f, false};
-    if (!_tempValid || !isfinite(tempC) || tempC < -5.0f || tempC > 60.0f) {
+    WaterReading r = {NAN, false};
+    if (!_adsReady) {
+        _lastPhVoltage = NAN;
         return r;
     }
 
-    float rawVoltage = 0.0f;
-    if (!readChannelVoltage(ADS_PH_CHANNEL, rawVoltage)) return r;
+    const int16_t raw = _ads.readADC_SingleEnded(ADS_PH_CHANNEL);
+    const float voltage = _ads.computeVolts(raw);
+    _lastPhVoltage = voltage;
+    if (!isfinite(voltage) || voltage < 0.01f || voltage > 5.25f) return r;
+    // Keep a computed diagnostic value even outside the calibrated electrode
+    // range. Quality remains false, but the quiet-window telemetry can report
+    // what the ADC actually implies instead of silently replacing it with NAN.
+    const bool electrodeOk =
+        voltage >= PH_ELECTRODE_V_MIN && voltage <= PH_ELECTRODE_V_MAX;
 
-    float phValue = phFromVoltageCalibrated(rawVoltage, tempC);
+    const bool tempOk =
+        _tempValid && isfinite(tempC) && tempC >= -5.0f && tempC <= 60.0f;
+    // Keep the raw voltage for diagnosis. A publishable pH value still
+    // requires a valid temperature; pH no longer participates in auto-spiral.
+    const float tempForCalc = tempOk ? tempC : 25.0f;
+    float phValue = phFromVoltageCalibrated(voltage, tempForCalc);
     if (!isfinite(phValue)) return r;
-    if (phValue < 0.0f)  phValue = 0.0f;
-    if (phValue > 14.0f) phValue = 14.0f;
     r.value = phValue;
-    r.valid = true;
+    r.valid = electrodeOk && tempOk &&
+              (phValue >= PH_PLAUSIBLE_MIN) && (phValue <= PH_PLAUSIBLE_MAX);
     return r;
 }
 
 WaterReading WaterSensors::readTurbidityNtu() {
-    WaterReading r = {0.0f, false};
-    _lastTurbVoltage = NAN;
-    if (!_adsReady) return r;
+    WaterReading r = {NAN, false};
+    if (!_adsReady) {
+        _lastTurbVoltage = NAN;
+        return r;
+    }
 
-    // Keep raw volts even below TURBIDITY_FAULT_V so Serial can show trim/open-wire.
     const int16_t raw = _ads.readADC_SingleEnded(ADS_TURB_CHANNEL);
     const float voltage = _ads.computeVolts(raw);
     _lastTurbVoltage = voltage;
     if (!isfinite(voltage) || voltage < 0.01f || voltage > 5.25f) return r;
-    if (voltage < TURBIDITY_FAULT_V) return r;
-#if !TURBIDITY_OPTICS_OK
-    // Voltage is logged via lastTurbVoltage(); do not publish NTU or arm spiral.
-    return r;
-#endif
 
     float ntu;
     if (voltage >= TURBIDITY_CLEAR_V) ntu = 0.0f;
@@ -258,6 +283,9 @@ WaterReading WaterSensors::readTurbidityNtu() {
         if (ntu < 0.0f) ntu = 0.0f;
     }
     r.value = ntu;
-    r.valid = true;
+    r.valid = (voltage >= TURBIDITY_FAULT_V);
+#if !TURBIDITY_OPTICS_OK
+    r.valid = false;
+#endif
     return r;
 }
