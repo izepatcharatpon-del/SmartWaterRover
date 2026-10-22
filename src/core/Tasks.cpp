@@ -1,7 +1,9 @@
 #include "core/Tasks.h"
 #include "core/StageReporter.h"
 #include "core/WaterSamplePolicy.h"
+#include "core/DiagnosticFormatting.h"
 #include "control/DriveController.h"
+#include "control/GridHeadingController.h"
 #include "config.h"
 #include <Preferences.h>
 #include <math.h>
@@ -82,6 +84,30 @@ static uint8_t radioStatusForLog(EspNowLink::TxResult result) {
         case EspNowLink::TX_RESULT_TIMEOUT:  return TELEMETRY_RADIO_TIMEOUT;
     }
     return TELEMETRY_RADIO_TIMEOUT;
+}
+
+static DiagnosticFormatting::PhReadReason phDiagnosticReason(PhSampleReason reason) {
+    using DiagnosticFormatting::PhReadReason;
+    switch (reason) {
+        case PhSampleReason::OK: return PhReadReason::OK;
+        case PhSampleReason::ADS_UNAVAILABLE: return PhReadReason::ADS_UNAVAILABLE;
+        case PhSampleReason::ADC_INVALID: return PhReadReason::ADC_INVALID;
+        case PhSampleReason::COMPUTATION_INVALID: return PhReadReason::COMPUTATION_INVALID;
+        case PhSampleReason::ELECTRODE_RANGE: return PhReadReason::ELECTRODE_RANGE;
+        case PhSampleReason::TEMP_INVALID: return PhReadReason::TEMP_INVALID;
+        case PhSampleReason::PH_IMPLAUSIBLE: return PhReadReason::PH_IMPLAUSIBLE;
+        default: return PhReadReason::NO_SAMPLE;
+    }
+}
+
+static DiagnosticFormatting::TxResult txDiagnosticResult(EspNowLink::TxResult result) {
+    switch (result) {
+        case EspNowLink::TX_RESULT_OK: return DiagnosticFormatting::TxResult::ACK;
+        case EspNowLink::TX_RESULT_SEND_ERR: return DiagnosticFormatting::TxResult::SEND_ERR;
+        case EspNowLink::TX_RESULT_NO_ACK: return DiagnosticFormatting::TxResult::NO_ACK;
+        case EspNowLink::TX_RESULT_TIMEOUT: return DiagnosticFormatting::TxResult::TIMEOUT;
+        default: return DiagnosticFormatting::TxResult::UNKNOWN;
+    }
 }
 
 static void toggleRadioTxPause(SystemContext* ctx) {
@@ -220,6 +246,8 @@ void navigationTask(void* pv) {
     DriveController driveController(
         MOTOR_PWM_LIMIT, MOTOR_MIN_PWM, MOTOR_PWM_SLEW_PER_SEC);
 
+    GridHeadingController gridHeading;
+
     TickType_t lastWake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(NAV_LOOP_PERIOD_MS);
     uint32_t lastLoopUs = micros();
@@ -249,6 +277,7 @@ void navigationTask(void* pv) {
 
         ctx->gps->update();
         ctx->compass->update();
+        const uint32_t compassSampleUs = micros();
         ctx->water->updateTemperatureNonBlocking();
         const bool adsWasReady = ctx->water->adsReady();
         if (ctx->water->pollAds(millis()) && !adsWasReady) {
@@ -820,6 +849,7 @@ void navigationTask(void* pv) {
         int leftPwm = 0, rightPwm = 0;
         DriveSource driveSource = DriveSource::NONE;
         bool driveRequestValid = false;
+        bool gridGuidanceUsed = false;
         int logBasePwm = 0;
         double logTargetLat = NAN, logTargetLon = NAN;
         float logNavBearing = NAN;
@@ -856,6 +886,7 @@ void navigationTask(void* pv) {
                         if (elapsed >= WATER_SAMPLE_HOLD_MS) {
                             g_waterSampleActive = false;
                             ctx->heading->reset();
+                            gridHeading.reset();
                             haveLastLosTarget = false;
                             Serial.println(F("[USV] water sample done"));
                         } else {
@@ -875,6 +906,7 @@ void navigationTask(void* pv) {
                             LOS_PASS_MARGIN_M);
                         if (skipped > 0) {
                             ctx->heading->reset();
+                            gridHeading.reset();
                             haveLastLosTarget = false;
                         }
                         if (WaterSamplePolicy::crossedBoundary(
@@ -912,6 +944,7 @@ void navigationTask(void* pv) {
                                     (tgt.lat != lastLosTarget.lat ||
                                      tgt.lon != lastLosTarget.lon)) {
                                     ctx->heading->reset();
+                                    gridHeading.reset();
                                 }
                                 lastLosTarget = tgt;
                                 haveLastLosTarget = true;
@@ -919,14 +952,17 @@ void navigationTask(void* pv) {
                                 float herr = HeadingController::computeHeadingError(
                                     los.bearingDeg, heading);
                                 int base = chooseBasePwm(
-                                    herr, los.distToEndM, MOTOR_CRUISE_PWM);
+                                    herr, los.distToEndM, GRID_CRUISE_PWM);
                                 logHeadingError = herr;
                                 logBasePwm = base;
-                                ctx->heading->calculateThrusterOutputs(
-                                    los.bearingDeg, heading, base, dt,
-                                    leftPwm, rightPwm);
-                                driveSource = DriveSource::GRID;
-                                driveRequestValid = true;
+                                const DriveRequest gridRequest = gridHeading.update(
+                                    los.bearingDeg, heading, base, compassSampleUs,
+                                    compassOk);
+                                leftPwm = gridRequest.leftPwm;
+                                rightPwm = gridRequest.rightPwm;
+                                driveSource = gridRequest.source;
+                                driveRequestValid = gridRequest.valid;
+                                gridGuidanceUsed = true;
                             }
                         }
                     }
@@ -1052,14 +1088,7 @@ void navigationTask(void* pv) {
             logDirectBearing = (float)Navigator::calculateBearing(
                 fix.lat, fix.lon, logTargetLat, logTargetLon);
         }
-        const int requestedLeftPwm = leftPwm;
-        const int requestedRightPwm = rightPwm;
-        const bool navTurnInPlace = driveRequestValid &&
-            (driveSource == DriveSource::GRID ||
-             driveSource == DriveSource::SPIRAL ||
-             driveSource == DriveSource::RTH) &&
-            (requestedLeftPwm != 0 || requestedRightPwm != 0) &&
-            ctx->heading->isTurningInPlace();
+        if (!gridGuidanceUsed) gridHeading.reset();
 
         DriveRequest driveRequest = {
             driveSource, leftPwm, rightPwm, driveRequestValid
@@ -1072,6 +1101,14 @@ void navigationTask(void* pv) {
             state == STATE_GRID_PATROL && !cmd.manualMode &&
                 g_waterSampleActive
         };
+        const int requestedLeftPwm = leftPwm;
+        const int requestedRightPwm = rightPwm;
+        const bool navTurnInPlace = driveRequestValid &&
+            (requestedLeftPwm != 0 || requestedRightPwm != 0) &&
+            (driveSource == DriveSource::GRID ||
+             driveSource == DriveSource::SPIRAL || driveSource == DriveSource::RTH) &&
+            (driveSource == DriveSource::GRID ? gridHeading.isTurningInPlace()
+                                               : ctx->heading->isTurningInPlace());
         const DriveDecision driveDecision =
             driveController.resolve(driveRequest, driveInterlocks, dt);
         leftPwm = driveDecision.leftPwm;
@@ -1079,6 +1116,10 @@ void navigationTask(void* pv) {
         ctx->motor->writeThrust(leftPwm, rightPwm);
         if (driveDecision.stopReason != DriveStopReason::NONE) {
             ctx->heading->reset();
+        }
+        if (driveDecision.stopReason != DriveStopReason::NONE &&
+            driveDecision.stopReason != DriveStopReason::REQUESTED_STOP) {
+            gridHeading.reset();
         }
 
         const int absL = leftPwm < 0 ? -leftPwm : leftPwm;
@@ -1119,6 +1160,33 @@ void navigationTask(void* pv) {
         logRec.drive_stop_reason = (uint8_t)driveDecision.stopReason;
         logRec.radio_tx_paused = ctx->radioTxPaused ? 1 : 0;
         logRec.battery_voltage = battV;
+        const PhSampleDiagnostics phDiag = ctx->water->lastPhDiagnostics();
+        DiagnosticFormatting::PhLogRecord& phLog = logRec.ph_diagnostic;
+        phLog.sampleId = phDiag.sampleId;
+        phLog.rawAdc = phDiag.rawAdc;
+        phLog.sampleMs = phDiag.sampleMs;
+        phLog.samplePresent = phDiag.samplePresent;
+        phLog.newSample = waterAdsSampled && phDiag.sampledThisCall;
+        phLog.adcVoltage = phDiag.voltage;
+        phLog.sensorPh = phDiag.sensorPh;
+        phLog.qualityValid = phDiag.qualityValid && phR.valid;
+        phLog.quietCount = g_phQuietCount;
+        phLog.sensorTempC = phDiag.sensorTempC;
+        phLog.effectiveTempC = phDiag.effectiveTempC;
+        phLog.temperatureValid = phDiag.temperatureValid;
+        phLog.calibrationSource = "UNKNOWN";
+        phLog.readReason = phDiagnosticReason(phDiag.reason);
+        if (state != STATE_GRID_PATROL) {
+            phLog.suppressionReason = DiagnosticFormatting::PhSuppressionReason::MODE_SUPPRESSED;
+        } else if (logWaterSamplePhase != 2) {
+            phLog.suppressionReason = DiagnosticFormatting::PhSuppressionReason::NOT_QUIET_WINDOW;
+        } else if (leftPwm != 0 || rightPwm != 0) {
+            phLog.suppressionReason = DiagnosticFormatting::PhSuppressionReason::MOTORS_NOT_STOPPED;
+        } else if (!isfinite(lastPh)) {
+            phLog.suppressionReason = DiagnosticFormatting::PhSuppressionReason::NO_FINITE_SAMPLE;
+        } else {
+            phLog.suppressionReason = DiagnosticFormatting::PhSuppressionReason::NONE;
+        }
         bool snapshotPublished = false;
         if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             ctx->snapshot.gps_lat         = fix.valid ? fix.lat : NAN;
@@ -1148,9 +1216,43 @@ void navigationTask(void* pv) {
             ctx->compassRawY               = ctx->compass->rawY();
             ctx->compassNvs                = ctx->compass->nvsLoaded() ? 1 : 0;
             ctx->compassCalRun             = ctx->compass->isCalibrating() ? 1 : 0;
+            SensorMonitorSnapshot& sensors = ctx->sensorMonitor;
+            sensors.available = true;
+            sensors.capturedMs = millis();
+            sensors.temperature = ctx->water->temperatureDiagnostics();
+            sensors.adsInitialized = ctx->water->adsReady();
+            if (waterAdsSampled) {
+                sensors.adsSampleAttempted = true;
+                sensors.adsSampleMs = sensors.capturedMs;
+            }
+            sensors.ph = phDiag;
+            sensors.phRead = phR.value;
+            sensors.phQuality = phR.valid;
+            sensors.turbRead = turbR.value;
+            sensors.turbQuality = turbR.valid;
+            sensors.phPublishReason = (uint8_t)phLog.suppressionReason;
+            sensors.gpsReady = gpsOk;
+            sensors.gpsAgeMs = gpsLocationAgeMs;
+            sensors.gpsSats = fix.sats;
+            sensors.gpsHdop = fix.hdop;
+            sensors.gpsSpeedKmh = fix.speedKmh;
+            sensors.gpsRawLat = rawGpsLat;
+            sensors.gpsRawLon = rawGpsLon;
+            sensors.motorLeft = (int16_t)leftPwm;
+            sensors.motorRight = (int16_t)rightPwm;
+            sensors.compassInitStage = ctx->compass->initStage();
+            sensors.compassIoError = ctx->compass->lastIoError();
+            sensors.compassRegister = ctx->compass->lastRegister();
+            sensors.compassReadCount = ctx->compass->readCount();
+            sensors.compassReadExpected = ctx->compass->readExpected();
+            sensors.compassGoodPresent = ctx->compass->hasGoodRead();
+            sensors.compassGoodMs = ctx->compass->lastGoodMs();
             ctx->homeDistM                 = distHomeM;
             ctx->homeSetFlag               = g_homeSet ? 1 : 0;
             logRec.boot_ms            = millis();
+            if (phLog.samplePresent) {
+                phLog.sampleAgeMs = logRec.boot_ms - phLog.sampleMs;
+            }
             logRec.sequence_number    = ++logSequence;
             logRec.gps_lat            = ctx->snapshot.gps_lat;
             logRec.gps_lon            = ctx->snapshot.gps_lon;
@@ -1194,6 +1296,12 @@ void navigationTask(void* pv) {
 
         if (snapshotPublished) {
             const GpsDateTime utc = ctx->gps->utcNow();
+            logRec.utc_age_ms = ctx->gps->utcAgeMs();
+            logRec.utc_age_known = logRec.utc_age_ms != UINT32_MAX;
+            logRec.ph_diagnostic.utcAvailable = utc.valid;
+            logRec.ph_diagnostic.utcSource = logRec.utc_age_known ? "GPS" : "NONE";
+            logRec.ph_diagnostic.utcAgeKnown = logRec.utc_age_known;
+            logRec.ph_diagnostic.utcAgeMs = logRec.utc_age_ms;
             if (utc.valid) {
                 logRec.utc_year   = utc.year;
                 logRec.utc_month  = utc.month;
@@ -1376,7 +1484,9 @@ void ioTask(void* pv) {
                 turbV = ctx->turbVoltage;
                 tC = tp.water_temp;
                 xSemaphoreGive(ctx->stateMutex);
+                const uint32_t txStartMs = millis();
                 const bool ok = ctx->link->sendTelemetry(tp);
+                const uint32_t txEndMs = millis();
                 const EspNowLink::TxDiag txDiag = EspNowLink::lastTx;
                 if (xSemaphoreTake(ctx->stateMutex, portMAX_DELAY) == pdTRUE) {
                     ctx->telemetryTxSeq = tp.sequence_number;
@@ -1390,6 +1500,32 @@ void ioTask(void* pv) {
                         ctx->snapshot.sequence_number = tp.sequence_number;
                     }
                     xSemaphoreGive(ctx->stateMutex);
+                }
+                if (ctx->logger && ctx->logger->isReady()) {
+                    DiagnosticFormatting::TxLogRecord txLog{};
+                    txLog.sequence = tp.sequence_number;
+                    txLog.sendStartMs = txStartMs;
+                    txLog.sendEndMs = txEndMs;
+                    txLog.latitude = tp.gps_lat;
+                    txLog.longitude = tp.gps_lon;
+                    txLog.ph = tp.water_ph;
+                    txLog.turbidity = tp.water_turbidity;
+                    txLog.temperatureC = tp.water_temp;
+                    txLog.mode = tp.current_mode;
+                    txLog.batteryPercent = tp.battery_percent;
+                    txLog.headingDeg = tp.heading_angle;
+                    txLog.result = txDiagnosticResult(txDiag.result);
+                    txLog.sendError = (int32_t)txDiag.sendErr;
+                    txLog.attempts = txDiag.attemptsUsed;
+                    txLog.noAckCount = txDiag.noAckCount;
+                    txLog.sendErrorCount = txDiag.sendErrCount;
+                    txLog.timeoutCount = txDiag.timeoutCount;
+                    txLog.wifiChannel = txDiag.wifiChannel;
+                    txLog.peerExists = txDiag.peerExist != 0;
+                    if (!ctx->logger->logTxDiagnostic(txLog) &&
+                        ctx->logger->txDiagnosticWriteFailCount() == 1) {
+                        Serial.println(F("[USV] TX diagnostic writer failed; radio result unchanged"));
+                    }
                 }
 #if RADIO_TRACE
                 Serial.printf(
@@ -1436,12 +1572,28 @@ void ioTask(void* pv) {
         }
 
         SdLogRecord logRec;
-        while (xQueueReceive(ctx->logQueue, &logRec, 0) == pdTRUE) {
+        const uint32_t collectStarted = millis();
+        for (unsigned rows = 0; rows < SD_LOG_ROWS_PER_IO_LOOP &&
+             (uint32_t)(millis() - collectStarted) < SD_LOG_COLLECT_BUDGET_MS; ++rows) {
+            if (ctx->logger && ctx->logger->isReady() &&
+                !ctx->logger->canAcceptLogPair()) break; // Retain the record in the queue.
+            if (xQueueReceive(ctx->logQueue, &logRec, 0) != pdTRUE) break;
             if (ctx->logger && ctx->logger->isReady()) {
                 if (!ctx->logger->logRecord(logRec)) {
                     ctx->logDropCount++;
                 }
+                if (!ctx->logger->logPhDiagnostic(
+                        logRec.boot_ms, logRec.sequence_number,
+                        logRec.ph_diagnostic) &&
+                    ctx->logger->phDiagnosticWriteFailCount() == 1) {
+                    Serial.println(F("[USV] pH diagnostic writer failed; continuing"));
+                }
+            } else {
+                ++ctx->logDropCount; // Explicit loss accounting when logging is unavailable.
             }
+        }
+        if (ctx->logger && ctx->logger->isReady() && !ctx->logger->service()) {
+            Serial.println(F("[USV] SD service failed; inspect SD counters and queued data"));
         }
 
         if (ctx->logger &&
@@ -1481,6 +1633,10 @@ void ioTask(void* pv) {
             float hdg = NAN;
             float homeD = NAN;
             uint8_t homeSet = 0;
+            SensorMonitorSnapshot sensors{};
+            TelemetryPacket published{};
+            float sensorPhV = NAN, sensorTurbV = NAN, sensorBattV = NAN;
+            bool haveSensorSnapshot = false;
             if (xSemaphoreTake(ctx->stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 cAddr  = ctx->compassAddr;
                 cFail  = ctx->compassFailCount;
@@ -1492,15 +1648,100 @@ void ioTask(void* pv) {
                 hdg    = ctx->snapshot.heading_angle;
                 homeD  = ctx->homeDistM;
                 homeSet = ctx->homeSetFlag;
+                sensors = ctx->sensorMonitor;
+                published = ctx->snapshot;
+                sensorPhV = ctx->phVoltage;
+                sensorTurbV = ctx->turbVoltage;
+                sensorBattV = ctx->batteryVoltage;
+                haveSensorSnapshot = sensors.available;
                 xSemaphoreGive(ctx->stateMutex);
             }
-            Serial.printf(
-                "[USV] compass addr=0x%02X fresh=%u fail=%u raw=%d,%d hdg=%.1f cal=%s "
-                "homeDist=%.1fm set=%u\n",
-                (unsigned)cAddr, (unsigned)cFresh, (unsigned)cFail,
-                (int)cX, (int)cY, hdg,
-                cCal ? "RUN" : (cNvs ? "NVS" : "FACT"),
-                homeD, (unsigned)homeSet);
+            if (haveSensorSnapshot) {
+                const uint32_t diagnosticMs = millis();
+                Serial.printf(
+                    "[USV] compass addr=0x%02X fresh=%u fail=%u raw=%d,%d hdg=%.1f cal=%s "
+                    "homeDist=%.1fm set=%u\n",
+                    (unsigned)cAddr, (unsigned)cFresh, (unsigned)cFail,
+                    (int)cX, (int)cY, hdg,
+                    cCal ? "RUN" : (cNvs ? "NVS" : "FACT"),
+                    homeD, (unsigned)homeSet);
+                Serial.printf(
+                    "[SENSOR] COMPASS init=%s io_error=%u reg=0x%02X read_bytes=%u/%u "
+                    "good_present=%u good_age_ms=%lu snapshot_age_ms=%lu\n",
+                    sensors.compassInitStage, (unsigned)sensors.compassIoError,
+                    (unsigned)sensors.compassRegister, (unsigned)sensors.compassReadCount,
+                    (unsigned)sensors.compassReadExpected, (unsigned)sensors.compassGoodPresent,
+                    (unsigned long)(sensors.compassGoodPresent
+                        ? diagnosticMs - sensors.compassGoodMs : 0),
+                    (unsigned long)(diagnosticMs - sensors.capturedMs));
+                const TemperatureDiagnostics& td = sensors.temperature;
+                const char* tempPublish = published.current_mode == STATE_STANDBY
+                    ? "MODE_SUPPRESSED" : (!td.lastGoodPresent ? "NO_VALID_SAMPLE"
+                        : (td.valid ? "LAST_VALID" : "CACHED_LAST_GOOD"));
+                Serial.printf(
+                    "[SENSOR] TEMP pin=%u devices_boot=%u present=%u read=%.3f valid=%u "
+                    "reason=%s read_age_ms=%lu good_present=%u last_good=%.3f good_age_ms=%lu "
+                    "published=%.3f publish=%s\n",
+                    (unsigned)TEMP_SENSOR_PIN, (unsigned)td.devicesAtBoot,
+                    (unsigned)td.samplePresent, td.readC, (unsigned)td.valid,
+                    WaterSensors::temperatureReasonName(td.reason),
+                    (unsigned long)(td.samplePresent ? diagnosticMs - td.sampleMs : 0),
+                    (unsigned)td.lastGoodPresent, td.lastGoodC,
+                    (unsigned long)(td.lastGoodPresent ? diagnosticMs - td.lastGoodMs : 0),
+                    published.water_temp, tempPublish);
+                // ADS init success is not proof that subsequent ADC transactions succeed.
+                Serial.printf(
+                    "[SENSOR] PH ads_init_ok=%u attempted=%u attempt_age_ms=%lu "
+                    "adc_present=%u adc_raw=%d V=%.3f computed=%.3f quality=%u "
+                    "read_reason=%s calc_temp=%.3f temp_valid=%u published=%.3f publish=%s\n",
+                    (unsigned)sensors.adsInitialized, (unsigned)sensors.adsSampleAttempted,
+                    (unsigned long)(sensors.adsSampleAttempted
+                        ? diagnosticMs - sensors.adsSampleMs : 0),
+                    (unsigned)sensors.ph.samplePresent, (int)sensors.ph.rawAdc,
+                    sensorPhV, sensors.phRead, (unsigned)sensors.phQuality,
+                    DiagnosticFormatting::phReadReasonName(phDiagnosticReason(sensors.ph.reason)),
+                    sensors.ph.effectiveTempC, (unsigned)sensors.ph.temperatureValid,
+                    published.water_ph,
+                    DiagnosticFormatting::phSuppressionReasonName(
+                        (DiagnosticFormatting::PhSuppressionReason)sensors.phPublishReason));
+                const char* turbReason = !sensors.adsInitialized ? "ADS_UNAVAILABLE"
+                    : (!sensors.adsSampleAttempted ? "NO_SAMPLE"
+                        : (!isfinite(sensors.turbRead) ? "ADC_OR_COMPUTATION_INVALID"
+                            : (!TURBIDITY_OPTICS_OK ? "OPTICS_DISABLED"
+                                : (sensors.turbQuality ? "OK" : "LOW_VOLTAGE"))));
+                Serial.printf(
+                    "[SENSOR] TURB ads_init_ok=%u V=%.3f computed=%.3f quality=%u "
+                    "read_reason=%s published=%.3f publish=%s attempt_age_ms=%lu\n",
+                    (unsigned)sensors.adsInitialized, sensorTurbV, sensors.turbRead,
+                    (unsigned)sensors.turbQuality, turbReason, published.water_turbidity,
+                    published.current_mode == STATE_STANDBY ? "MODE_SUPPRESSED"
+                        : (sensors.turbQuality ? "LAST_VALID" : "CACHED_OR_NO_VALID_SAMPLE"),
+                    (unsigned long)(sensors.adsSampleAttempted
+                        ? diagnosticMs - sensors.adsSampleMs : 0));
+                Serial.printf(
+                    "[SENSOR] NAV gps_ready=%u raw_lat=%.6f raw_lon=%.6f sats=%u "
+                    "hdop=%.2f location_age_ms=%lu speed_kmh=%.2f "
+                    "mode=%u applied_pwm=%d,%d batt_V=%.3f\n",
+                    (unsigned)sensors.gpsReady, sensors.gpsRawLat, sensors.gpsRawLon,
+                    (unsigned)sensors.gpsSats, sensors.gpsHdop,
+                    (unsigned long)sensors.gpsAgeMs, sensors.gpsSpeedKmh,
+                    (unsigned)published.current_mode, (int)sensors.motorLeft,
+                    (int)sensors.motorRight, sensorBattV);
+            } else {
+                Serial.println(F("[SENSOR] SNAPSHOT_UNAVAILABLE (not a sensor failure)"));
+            }
+            if (ctx->logger) {
+                Serial.printf("[SD] ready=%u main=%lu/%lu/%lu ph=%lu/%lu/%lu pending_bytes=%u,%u max_service_ms=%lu max_sync_gap_ms=%lu sync_misses=%lu write_fail=%lu ph_fail=%lu tx_fail=%lu ph_stopped=%u queue=%u/%u\n",
+                    (unsigned)ctx->logger->isReady(),
+                    (unsigned long)ctx->logger->mainAcceptedRows(), (unsigned long)ctx->logger->mainWrittenRows(), (unsigned long)ctx->logger->mainSyncedRows(),
+                    (unsigned long)ctx->logger->phAcceptedRows(), (unsigned long)ctx->logger->phWrittenRows(), (unsigned long)ctx->logger->phSyncedRows(),
+                    (unsigned)ctx->logger->mainPendingBytes(), (unsigned)ctx->logger->phPendingBytes(),
+                    (unsigned long)ctx->logger->maxServiceMs(), (unsigned long)ctx->logger->maxSyncGapMs(),
+                    (unsigned long)ctx->logger->syncDeadlineMisses(), (unsigned long)ctx->logger->writeFailCount(),
+                    (unsigned long)ctx->logger->phDiagnosticWriteFailCount(), (unsigned long)ctx->logger->txDiagnosticWriteFailCount(),
+                    (unsigned)ctx->logger->phDiagnosticStopped(),
+                    (unsigned)uxQueueMessagesWaiting(ctx->logQueue), (unsigned)SD_LOG_QUEUE_LENGTH);
+            }
 #endif
         }
 

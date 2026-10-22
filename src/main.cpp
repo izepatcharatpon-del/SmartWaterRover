@@ -2,8 +2,10 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <string.h>
+#include <esp_system.h>
 
 #include "config.h"
+#include "core/BuildIdentity.h"
 #include "core/Tasks.h"
 
 static WaterSensors        water;
@@ -26,20 +28,67 @@ static SystemContext ctx;
 static uint8_t GATEWAY_MAC[6] = {0x88, 0x57, 0x21, 0xAD, 0xAE, 0x8C};
 static const uint8_t DUMMY_GATEWAY_MAC[6] = {0x24, 0x6F, 0x28, 0x00, 0x00, 0x01};
 
+static const char* i2cStatusName(uint8_t status) {
+    switch (status) {
+        case 0: return "ACK";
+        case 2: return "NACK_ADDRESS";
+        case 3: return "NACK_DATA";
+        case 5: return "TIMEOUT";
+        default: return "BUS_ERROR";
+    }
+}
+
+static void printI2cProbe(uint8_t address) {
+    Wire.beginTransmission(address);
+    const uint8_t status = Wire.endTransmission();
+    Serial.printf("[USV] I2C probe addr=0x%02X status=%u reason=%s SDA=%d SCL=%d\n",
+                  (unsigned)address, (unsigned)status, i2cStatusName(status),
+                  digitalRead(I2C_SDA_PIN), digitalRead(I2C_SCL_PIN));
+}
+
 static void printI2cScan() {
-    Serial.print(F("[USV] I2C scan:"));
-    uint8_t found = 0;
+    const uint32_t started = millis();
+    Serial.println(F("[USV] I2C scan begin (1..126; 2=NACK 4=ERROR 5=TIMEOUT)"));
+    uint8_t found = 0, nack = 0, timeout = 0, other = 0;
     for (uint8_t a = 1; a < 127; a++) {
         Wire.beginTransmission(a);
-        if (Wire.endTransmission() == 0) {
-            Serial.printf(" 0x%02X", a);
+        const uint8_t status = Wire.endTransmission();
+        if (status == 0) {
+            Serial.printf("[USV] I2C found addr=0x%02X\n", (unsigned)a);
             found++;
+        } else if (status == 2 || status == 3) {
+            nack++;
+        } else if (status == 5) {
+            timeout++;
+        } else {
+            other++;
+        }
+        if ((a % 16) == 0) {
+            Serial.printf("[USV] I2C scan progress addr=0x%02X elapsed_ms=%lu\n",
+                          (unsigned)a, (unsigned long)(millis() - started));
         }
     }
-    if (found == 0) {
-        Serial.print(F(" (none)"));
+    Serial.printf("[USV] I2C scan done found=%u nack=%u timeout=%u error=%u "
+                  "elapsed_ms=%lu SDA=%d SCL=%d\n",
+                  (unsigned)found, (unsigned)nack, (unsigned)timeout, (unsigned)other,
+                  (unsigned long)(millis() - started),
+                  digitalRead(I2C_SDA_PIN), digitalRead(I2C_SCL_PIN));
+}
+
+static const char* resetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "POWERON";
+        case ESP_RST_EXT: return "EXTERNAL";
+        case ESP_RST_SW: return "SOFTWARE";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WATCHDOG";
+        case ESP_RST_TASK_WDT: return "TASK_WATCHDOG";
+        case ESP_RST_WDT: return "WATCHDOG";
+        case ESP_RST_DEEPSLEEP: return "DEEP_SLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "UNKNOWN";
     }
-    Serial.println();
 }
 
 static void printMac(const char* label, const uint8_t mac[6]) {
@@ -88,23 +137,43 @@ void setup() {
     Serial.setDebugOutput(false);
     delay(200);
     Serial.println(F("[USV] boot"));
+    const esp_reset_reason_t resetReason = esp_reset_reason();
+    Serial.printf("[USV] reset_reason=%s code=%u (ESP-IDF enum, not ROM rst code)\n",
+                  resetReasonName(resetReason), (unsigned)resetReason);
+    Serial.printf("[USV] build_id=%s schema=%s (dirty source bytes; not git HEAD)\n",
+                  USV_BUILD_ID, USV_DIAGNOSTIC_SCHEMA);
     pinMode(COMPASS_CAL_BUTTON_PIN, INPUT_PULLUP);
 
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    const bool wireOk = Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setTimeOut(I2C_TIMEOUT_MS);
+    Serial.printf("[USV] I2C begin=%s SDA_pin=%u SCL_pin=%u timeout_ms=%u "
+                  "SDA=%d SCL=%d (line levels only; not a voltage measurement)\n",
+                  wireOk ? "OK" : "FAIL", (unsigned)I2C_SDA_PIN,
+                  (unsigned)I2C_SCL_PIN, (unsigned)I2C_TIMEOUT_MS,
+                  digitalRead(I2C_SDA_PIN), digitalRead(I2C_SCL_PIN));
+    printI2cProbe(QMC5883P_I2C_ADDR);
+    printI2cProbe(ADS1115_I2C_ADDR);
 
     const bool waterOk = water.begin();
+    const PhCalibration phCalAtBoot = water.getCalibration();
+    const char* phCalSourceAtBoot =
+        WaterSensors::calibrationSourceName(water.calibrationSource());
     if (!waterOk) {
         Serial.println(F("[USV] ADS1115 init FAILED — anomaly detection disabled"));
     } else {
-        PhCalibration pc = water.getCalibration();
-        if (pc.valid) {
+        if (phCalAtBoot.valid) {
             Serial.printf("[USV] pH cal OK  V4.01=%.3f V6.86=%.3f V9.18=%.3f\n",
-                          pc.v401, pc.v686, pc.v918);
+                          phCalAtBoot.v401, phCalAtBoot.v686, phCalAtBoot.v918);
         } else {
             Serial.println(F("[USV] pH cal not set — using default Nernst (run 3-point cal)"));
         }
     }
+    Serial.printf("[USV] pH calibration source=%s valid=%u per-sample provenance=UNKNOWN\n",
+                  phCalSourceAtBoot, phCalAtBoot.valid ? 1U : 0U);
+    Serial.printf("[USV] TEMP OneWire pin=%u devices_boot=%u async_wait_ms=750\n",
+                  (unsigned)TEMP_SENSOR_PIN,
+                  (unsigned)water.temperatureDiagnostics().devicesAtBoot);
+    Serial.println(F("[USV] compass begin start"));
     battery.begin();
     if (compass.begin()) {
         Serial.printf("[USV] compass OK (QMC5883P @ 0x%02X)\n", compass.i2cAddress());
@@ -117,6 +186,11 @@ void setup() {
                       (double)COMPASS_YAW_OFFSET_DEG, (int)COMPASS_YAW_MIRROR);
     } else {
         Serial.println(F("[USV] compass FAIL — need QMC5883P@0x2C chipID 0x80"));
+        Serial.printf("[USV] compass init stage=%s io_error=%u reg=0x%02X "
+                      "read_bytes=%u/%u observed=0x%02X\n",
+                      compass.initStage(), (unsigned)compass.lastIoError(),
+                      (unsigned)compass.lastRegister(), (unsigned)compass.readCount(),
+                      (unsigned)compass.readExpected(), (unsigned)compass.observedValue());
         printI2cScan();
         Serial.println(F("[USV] if scan shows 0x0D it is QMC5883L not P; 0x48 only = ADS, compass not on bus"));
     }
@@ -124,7 +198,9 @@ void setup() {
     gps.begin();
     gps.configureSeaMode();
     motor.begin();
-    const bool loggerOk = logger.begin();
+    const bool loggerOk = logger.begin(
+        phCalAtBoot.v401, phCalAtBoot.v686, phCalAtBoot.v918,
+        phCalAtBoot.valid, phCalSourceAtBoot);
     if (loggerOk) {
         Serial.printf("[USV] SD logger OK %s\n", logger.filename());
     } else {
@@ -171,7 +247,7 @@ void setup() {
     ctx.ackDropCount = 0;
     ctx.stageDropCount = 0;
 
-    ctx.logQueue   = xQueueCreate(16, sizeof(SdLogRecord));
+    ctx.logQueue   = xQueueCreate(SD_LOG_QUEUE_LENGTH, sizeof(SdLogRecord));
     ctx.stageQueue = xQueueCreate(STAGE_STATUS_QUEUE_LENGTH,
                                   sizeof(StageStatusPacket));
     ctx.stateMutex = xSemaphoreCreateMutex();

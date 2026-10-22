@@ -18,6 +18,14 @@ public:
     uint8_t failCount() const { return _failCount; }
     int16_t rawX() const { return _rawX; }
     int16_t rawY() const { return _rawY; }
+    const char* initStage() const { return _initStage; }
+    uint8_t lastIoError() const { return _lastIoError; }
+    uint8_t lastRegister() const { return _lastRegister; }
+    uint8_t readCount() const { return _readCount; }
+    uint8_t readExpected() const { return _readExpected; }
+    uint8_t observedValue() const { return _observedValue; }
+    bool hasGoodRead() const { return _hasGoodRead; }
+    uint32_t lastGoodMs() const { return _lastGoodMs; }
 
     bool nvsLoaded() const { return _nvsLoaded; }
     bool isCalibrating() const { return _calibrating; }
@@ -42,6 +50,10 @@ private:
     uint32_t _calStartMs;
     uint16_t _calSamples;
     float   _calMinX, _calMaxX, _calMinY, _calMaxY;
+    const char* _initStage;
+    uint8_t _lastIoError, _lastRegister, _readCount, _readExpected, _observedValue;
+    bool _hasGoodRead;
+    uint32_t _lastGoodMs;
 
     bool writeRegister(uint8_t reg, uint8_t value);
     bool readRegisters(uint8_t reg, uint8_t* buf, uint8_t len);

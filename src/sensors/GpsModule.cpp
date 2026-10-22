@@ -179,6 +179,15 @@ bool GpsModule::hasTime() const {
     return _gps.time.isValid() && const_cast<TinyGPSTime&>(_gps.time).age() < 5000;
 }
 
+uint32_t GpsModule::utcAgeMs() const {
+    TinyGPSDate& date = const_cast<TinyGPSDate&>(_gps.date);
+    TinyGPSTime& time = const_cast<TinyGPSTime&>(_gps.time);
+    if (!date.isValid() || !time.isValid()) return UINT32_MAX;
+    const uint32_t dateAge = (uint32_t)date.age();
+    const uint32_t timeAge = (uint32_t)time.age();
+    return dateAge > timeAge ? dateAge : timeAge;
+}
+
 int GpsModule::localHour() const {
     if (!hasTime()) return -1;
     // TinyGPSPlus hour() is non-const; cast is safe (read-only use).

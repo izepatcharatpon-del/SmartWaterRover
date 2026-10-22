@@ -35,6 +35,19 @@
 #define SD_MISO_PIN            13
 #define SD_CS_PIN              14
 
+// Preserve every navigation row; batch physical SD writes on the IO owner.
+#define SD_LOG_QUEUE_LENGTH       64
+#define SD_LOG_ROWS_PER_IO_LOOP   8
+#define SD_LOG_COLLECT_BUDGET_MS  5
+#define SD_LOG_MAIN_BUFFER_BYTES 16384
+#define SD_LOG_PH_BUFFER_BYTES   8192
+#define SD_LOG_WRITE_BYTES       4096
+#define SD_LOG_MIN_BATCH_BYTES   1024
+#define SD_LOG_MAX_BATCH_AGE_MS  250UL
+#define SD_LOG_SYNC_INTERVAL_MS  500UL
+#define SD_LOG_DURABILITY_MS     1000UL
+
+
 // AA118 5:1. One 3S pack feeds motors + board; USB is programming only.
 #define BATTERY_ADC_PIN        4
 #define BATTERY_DIVIDER_RATIO  5.0f
@@ -64,6 +77,15 @@
 #define MOTOR_PWM_LIMIT        178
 #define MOTOR_MIN_PWM          80
 #define MOTOR_CRUISE_PWM       130
+#define GRID_CRUISE_PWM        110   // provisional GRID-only cruise tuning
+// Joint-simulation balanced GRID profile; physical validation pending.
+#define GRID_HEADING_KP        2.50f
+#define GRID_HEADING_KI        0.55f
+#define GRID_HEADING_KD        0.30f
+#define GRID_RATE_FILTER_TAU_S 0.20f // compass-derived rate damping, not a stop gate
+#define GRID_HEADING_DEADZONE_DEG 2.0f
+#define GRID_STEERING_SLEW_PWM_PER_SEC 200.0f
+#define GRID_INTEGRAL_LIMIT_PWM 20.0f
 #define MOTOR_APPROACH_PWM     110
 #define MOTOR_PWM_SLEW_PER_SEC 600.0f // ~30 PWM per 50 ms navigation tick
 
@@ -72,15 +94,26 @@
 #define ADS_RETRY_MS           5000UL  // re-init ADS if boot begin() failed
 // Coast at survey vertices so high-impedance water probes can be measured
 // without motor noise. The loop and all safety checks continue to run.
-#define WATER_SAMPLE_EVERY_N_WAYPOINTS 4
-#define WATER_SAMPLE_SETTLE_MS          500UL
-#define WATER_SAMPLE_MEASURE_MS        2500UL
+#define WATER_SAMPLE_EVERY_N_WAYPOINTS 2
+#define WATER_SAMPLE_SETTLE_MS         3000UL
+#define WATER_SAMPLE_MEASURE_MS        5000UL
 #define WATER_SAMPLE_HOLD_MS \
     (WATER_SAMPLE_SETTLE_MS + WATER_SAMPLE_MEASURE_MS)
 #define HEADING_KP             2.50f
 #define HEADING_KI             0.05f
 #define HEADING_KD             0.80f
 #define PID_DERIV_ALPHA        0.30f
+// GRID capture only: provisional software design values, pending bench/pond
+// validation. Existing gains, motor limits, LOS geometry and sampling stay fixed.
+#define GRID_CAPTURE_RATE_MAX_DPS  5.0f
+#define GRID_CAPTURE_DWELL_US      500000UL
+#define GRID_CAPTURE_FORWARD_PWM  80
+#define GRID_CAPTURE_PWM_LIMIT    100
+#define GRID_CAPTURE_CORR_DEADBAND_PWM 8.0f
+#define GRID_CAPTURE_SAMPLE_MIN_US 1000UL
+#define GRID_CAPTURE_SAMPLE_MAX_US 250000UL
+#define GRID_CAPTURE_RATE_TAU_S    0.05f
+#define GRID_CAPTURE_TIMEOUT_US    12000000UL
 #define WAYPOINT_RADIUS_M      3.0f
 #define GRID_LOS_LOOKAHEAD_M   6.0f   // gentler line capture on long GRID legs
 #define LOS_LOOKAHEAD_M        3.0f   // SPIRAL keeps its existing lookahead

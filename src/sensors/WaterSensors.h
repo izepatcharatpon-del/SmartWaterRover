@@ -20,6 +20,58 @@ struct PhCalibration {
     bool  valid;
 };
 
+enum class PhSampleReason : uint8_t {
+    NO_SAMPLE = 0,
+    OK,
+    ADS_UNAVAILABLE,
+    ADC_INVALID,
+    COMPUTATION_INVALID,
+    ELECTRODE_RANGE,
+    TEMP_INVALID,
+    PH_IMPLAUSIBLE
+};
+
+struct PhSampleDiagnostics {
+    uint32_t sampleId;
+    uint32_t sampleMs;
+    int16_t rawAdc;
+    float voltage;
+    float sensorPh;
+    float sensorTempC;
+    float effectiveTempC;
+    bool samplePresent;
+    bool sampledThisCall;
+    bool qualityValid;
+    bool temperatureValid;
+    PhSampleReason reason;
+};
+
+enum class PhCalibrationSource : uint8_t {
+    UNKNOWN = 0,
+    NVS,
+    FACTORY_DEFAULT,
+    FALLBACK
+};
+
+enum class TemperatureReadReason : uint8_t {
+    NO_SAMPLE = 0,
+    OK,
+    READ_FAILED,
+    OUT_OF_RANGE
+};
+
+struct TemperatureDiagnostics {
+    bool samplePresent;
+    float readC;
+    bool valid;
+    uint32_t sampleMs;
+    TemperatureReadReason reason;
+    bool lastGoodPresent;
+    float lastGoodC;
+    uint32_t lastGoodMs;
+    uint8_t devicesAtBoot;
+};
+
 class WaterSensors {
 public:
     WaterSensors();
@@ -32,8 +84,11 @@ public:
     void  updateTemperatureNonBlocking();
     float getWaterTemp() const { return _waterTemp; }
     bool  tempValid() const { return _tempValid; }
+    TemperatureDiagnostics temperatureDiagnostics() const { return _tempDiagnostics; }
+    static const char* temperatureReasonName(TemperatureReadReason reason);
 
     WaterReading readPh(float tempC);
+    PhSampleDiagnostics lastPhDiagnostics() const { return _phDiagnostics; }
     WaterReading readTurbidityNtu();
     // Last ADS A0/A1 volts (kept even when pH/NTU are invalid).
     float lastPhVoltage() const { return _lastPhVoltage; }
@@ -57,6 +112,8 @@ public:
     void setCalibration(float v401, float v686, float v918);
     void resetCalibration();
     PhCalibration getCalibration() const { return _phCal; }
+    PhCalibrationSource calibrationSource() const { return _phCalSource; }
+    static const char* calibrationSourceName(PhCalibrationSource source);
     bool hasCaptured401() const { return _cap401; }
     bool hasCaptured686() const { return _cap686; }
     bool hasCaptured918() const { return _cap918; }
@@ -77,11 +134,14 @@ private:
     bool              _adsReady;
     unsigned long     _lastAdsRetryMs;
     PhCalibration     _phCal;
+    PhCalibrationSource _phCalSource;
 
     float _vCap401, _vCap686, _vCap918;
     bool  _cap401, _cap686, _cap918;
     float _lastPhVoltage;
     float _lastTurbVoltage;
+    PhSampleDiagnostics _phDiagnostics;
+    TemperatureDiagnostics _tempDiagnostics;
 
     bool readChannelVoltage(uint8_t channel, float& outV);
     float phFromVoltageCalibrated(float volts, float tempC) const;

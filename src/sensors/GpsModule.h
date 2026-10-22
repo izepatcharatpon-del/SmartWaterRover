@@ -46,6 +46,7 @@ public:
     GpsLossTier getLossTier();
     unsigned long timeSinceFix() const;
     bool        hasTime() const;
+    uint32_t    utcAgeMs() const;
     int         localHour() const;
     GpsDateTime utcNow() const;
 

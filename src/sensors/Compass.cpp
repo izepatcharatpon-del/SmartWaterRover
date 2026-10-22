@@ -34,23 +34,34 @@ Compass::Compass()
       _calStartMs(0),
       _calSamples(0),
       _calMinX(0.0f), _calMaxX(0.0f),
-      _calMinY(0.0f), _calMaxY(0.0f) {}
+      _calMinY(0.0f), _calMaxY(0.0f),
+      _initStage("NOT_STARTED"),
+      _lastIoError(0), _lastRegister(0), _readCount(0), _readExpected(0),
+      _observedValue(0), _hasGoodRead(false), _lastGoodMs(0) {}
 
 bool Compass::writeRegister(uint8_t reg, uint8_t value) {
     if (_addr == 0) return false;
+    _lastRegister = reg;
+    _readCount = _readExpected = 0;
     Wire.beginTransmission(_addr);
     Wire.write(reg);
     Wire.write(value);
-    return Wire.endTransmission() == 0;
+    _lastIoError = Wire.endTransmission();
+    return _lastIoError == 0;
 }
 
 bool Compass::readRegisters(uint8_t reg, uint8_t* buf, uint8_t len) {
     if (_addr == 0) return false;
+    _lastRegister = reg;
+    _readCount = 0;
+    _readExpected = len;
     Wire.beginTransmission(_addr);
     Wire.write(reg);
     // Datasheet 8.2.4: repeated START between register write and data read.
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((int)_addr, (int)len) != (int)len) return false;
+    _lastIoError = Wire.endTransmission(false);
+    if (_lastIoError != 0) return false;
+    _readCount = Wire.requestFrom((int)_addr, (int)len);
+    if (_readCount != len) return false;
     for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
     return true;
 }
@@ -59,19 +70,30 @@ bool Compass::begin() {
     _addr = QMC5883P_I2C_ADDR;
     _fresh = false;
     _failCount = 0;
+    _hasGoodRead = false;
+    _lastIoError = 0;
+    _readCount = _readExpected = 0;
+    _observedValue = 0;
+    _initStage = "PROBE";
 
     Wire.beginTransmission(_addr);
-    if (Wire.endTransmission() != 0) {
+    _lastIoError = Wire.endTransmission();
+    if (_lastIoError != 0) {
         _addr = 0;
         return false;
     }
 
     uint8_t id = 0;
-    if (!readRegisters(P_REG_CHIPID, &id, 1) || id != QMC5883P_CHIP_ID) {
+    _initStage = "CHIP_ID_READ";
+    const bool idRead = readRegisters(P_REG_CHIPID, &id, 1);
+    _observedValue = id;
+    if (!idRead || id != QMC5883P_CHIP_ID) {
+        if (idRead) _initStage = "CHIP_ID_MISMATCH";
         _addr = 0;
         return false;
     }
 
+    _initStage = "RESET_WRITE";
     if (!writeRegister(P_REG_CTRL2, 0x80)) {
         _addr = 0;
         return false;
@@ -80,20 +102,27 @@ bool Compass::begin() {
     // Soft reset leaves suspend (no measurements). CTRL2 must be rewritten
     // with set/reset + range or XYZ stay 0 while I2C still ACKs.
     (void)writeRegister(P_REG_AXIS_SIGN, P_AXIS_SIGN_XYZ);
+    _initStage = "RANGE_WRITE";
     if (!writeRegister(P_REG_CTRL2, P_CTRL2_SETRESET_8G)) {
         _addr = 0;
         return false;
     }
+    _initStage = "MODE_WRITE";
     if (!writeRegister(P_REG_CTRL1, P_CTRL1_CONT_200HZ)) {
         _addr = 0;
         return false;
     }
     uint8_t ctrl1 = 0;
-    if (!readRegisters(P_REG_CTRL1, &ctrl1, 1) || ctrl1 != P_CTRL1_CONT_200HZ) {
+    _initStage = "MODE_READ";
+    const bool modeRead = readRegisters(P_REG_CTRL1, &ctrl1, 1);
+    _observedValue = ctrl1;
+    if (!modeRead || ctrl1 != P_CTRL1_CONT_200HZ) {
+        if (modeRead) _initStage = "MODE_MISMATCH";
         _addr = 0;
         return false;
     }
     loadCalibration();
+    _initStage = "READY";
     return true;
 }
 
@@ -115,6 +144,8 @@ bool Compass::update() {
     _rawZ = (int16_t)(buf[4] | (buf[5] << 8));
     _fresh = true;
     _failCount = 0;
+    _hasGoodRead = true;
+    _lastGoodMs = millis();
     if (_calibrating) {
         collectCalibrationSample();
     }

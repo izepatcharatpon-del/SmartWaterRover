@@ -38,6 +38,33 @@ struct CommandState {
     bool     forceSpiral;
 };
 
+// Navigation owns sensor reads; IO only prints this mutex-protected copy.
+struct SensorMonitorSnapshot {
+    bool available;
+    uint32_t capturedMs;
+    TemperatureDiagnostics temperature;
+    bool adsInitialized;
+    bool adsSampleAttempted;
+    uint32_t adsSampleMs;
+    PhSampleDiagnostics ph;
+    float phRead;
+    bool phQuality;
+    float turbRead;
+    bool turbQuality;
+    uint8_t phPublishReason;
+    bool gpsReady;
+    uint32_t gpsAgeMs;
+    uint8_t gpsSats;
+    float gpsHdop;
+    float gpsSpeedKmh;
+    double gpsRawLat, gpsRawLon;
+    int16_t motorLeft, motorRight;
+    const char* compassInitStage;
+    uint8_t compassIoError, compassRegister, compassReadCount, compassReadExpected;
+    bool compassGoodPresent;
+    uint32_t compassGoodMs;
+};
+
 struct SystemContext {
     WaterSensors*        water;
     BatteryMonitor*      battery;
@@ -59,6 +86,7 @@ struct SystemContext {
     SemaphoreHandle_t stateMutex;
 
     TelemetryPacket   snapshot;
+    SensorMonitorSnapshot sensorMonitor;
     CommandState      command;
     float             batteryVoltage;
     float             phVoltage;

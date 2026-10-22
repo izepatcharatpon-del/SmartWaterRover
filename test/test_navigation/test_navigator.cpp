@@ -9,6 +9,7 @@
 #include "control/PidController.h"
 #include "control/HeadingController.h"
 #include "control/DriveController.h"
+#include "control/GridHeadingController.h"
 #include "core/MissionFsm.h"
 #include "core/StageReporter.h"
 #include "core/WaterSamplePolicy.h"
@@ -1303,11 +1304,13 @@ void test_turbidity_cooldown_blocks_same_plume(void) {
     TEST_ASSERT_TRUE(monitor.updateTurbidity(60.0f, false, now));
 }
 
-void test_water_hold_is_three_seconds_with_ten_measurements(void) {
-    TEST_ASSERT_EQUAL_UINT32(3000UL, WATER_SAMPLE_HOLD_MS);
+void test_water_hold_is_eight_seconds_with_twenty_measurements(void) {
+    TEST_ASSERT_EQUAL_UINT32(3000UL, WATER_SAMPLE_SETTLE_MS);
+    TEST_ASSERT_EQUAL_UINT32(5000UL, WATER_SAMPLE_MEASURE_MS);
+    TEST_ASSERT_EQUAL_UINT32(8000UL, WATER_SAMPLE_HOLD_MS);
     const uint32_t adsPeriod =
         NAV_LOOP_PERIOD_MS * WATER_ADS_EVERY_N_LOOPS;
-    TEST_ASSERT_EQUAL_UINT32(10UL, WATER_SAMPLE_MEASURE_MS / adsPeriod);
+    TEST_ASSERT_EQUAL_UINT32(20UL, WATER_SAMPLE_MEASURE_MS / adsPeriod);
 }
 
 void test_water_sample_boundary_includes_final_waypoint(void) {
@@ -1350,9 +1353,33 @@ void test_fsm_gps_fault_latches_estop(void) {
     TEST_ASSERT_EQUAL(STATE_STANDBY, fsm.tick(in));
 }
 
+void test_grid_smoothing_preserves_final_drive_interlocks_and_resumes() {
+    GridHeadingController heading;
+    DriveController drive(MOTOR_PWM_LIMIT, MOTOR_MIN_PWM, MOTOR_PWM_SLEW_PER_SEC);
+    DriveInterlocks locks{STATE_GRID_PATROL, SafetyState::NORMAL, false, true, false};
+    uint32_t us = 50000;
+    auto tick = [&]() {
+        auto request = heading.update(90, 90, GRID_CRUISE_PWM, us, true);
+        us += 50000;
+        return drive.resolve(request, locks, .05f);
+    };
+    TEST_ASSERT_TRUE(tick().leftPwm > 0);
+    locks.waterSampleHold = true;
+    TEST_ASSERT_TRUE(tick().stopReason == DriveStopReason::WATER_SAMPLE);
+    heading.reset();
+    locks.waterSampleHold = false;
+    TEST_ASSERT_TRUE(tick().leftPwm > 0);
+    locks.navigationAvailable = false;
+    TEST_ASSERT_TRUE(tick().stopReason == DriveStopReason::NAVIGATION_UNAVAILABLE);
+    locks.navigationAvailable = true;
+    locks.emergencyPending = true;
+    TEST_ASSERT_TRUE(tick().stopReason == DriveStopReason::HARD_STOP);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_distance_latitude_step);
+    RUN_TEST(test_grid_smoothing_preserves_final_drive_interlocks_and_resumes);
     RUN_TEST(test_distance_zero);
     RUN_TEST(test_bearing_due_north);
     RUN_TEST(test_bearing_due_east);
@@ -1402,7 +1429,7 @@ int main(int, char**) {
     RUN_TEST(test_turbidity_stale_gap_resets_partial_strong_average);
     RUN_TEST(test_turbidity_stale_gap_restarts_baseline_dwell);
     RUN_TEST(test_turbidity_cooldown_blocks_same_plume);
-    RUN_TEST(test_water_hold_is_three_seconds_with_ten_measurements);
+    RUN_TEST(test_water_hold_is_eight_seconds_with_twenty_measurements);
     RUN_TEST(test_water_sample_boundary_includes_final_waypoint);
     RUN_TEST(test_grid_completion_waits_for_final_water_sample);
     RUN_TEST(test_safety_critical_and_rth);

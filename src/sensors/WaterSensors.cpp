@@ -30,10 +30,14 @@ WaterSensors::WaterSensors()
       _tempValid(false),
       _adsReady(false),
       _lastAdsRetryMs(0),
+      _phCalSource(PhCalibrationSource::UNKNOWN),
       _vCap401(NAN), _vCap686(NAN), _vCap918(NAN),
       _cap401(false), _cap686(false), _cap918(false),
       _lastPhVoltage(NAN),
-      _lastTurbVoltage(NAN) {
+      _lastTurbVoltage(NAN),
+      _phDiagnostics{},
+      _tempDiagnostics{false, NAN, false, 0, TemperatureReadReason::NO_SAMPLE,
+                       false, NAN, 0, 0} {
     resetCalibration();
 }
 
@@ -44,6 +48,7 @@ bool WaterSensors::begin() {
     }
 
     _temp.begin();
+    _tempDiagnostics.devicesAtBoot = _temp.getDeviceCount();
     _temp.setWaitForConversion(false);
     _temp.requestTemperatures();
     _lastTempRequest = millis();
@@ -74,14 +79,34 @@ bool WaterSensors::readChannelVoltage(uint8_t channel, float& outV) {
 void WaterSensors::updateTemperatureNonBlocking() {
     if (millis() - _lastTempRequest >= (unsigned long)TEMP_CONVERSION_MS) {
         float t = _temp.getTempCByIndex(0);
+        _tempDiagnostics.samplePresent = true;
+        _tempDiagnostics.readC = t;
+        _tempDiagnostics.sampleMs = millis();
         if (t > -55.0f && t < 125.0f) {
             _waterTemp = t;
             _tempValid = true;
+            _tempDiagnostics.reason = TemperatureReadReason::OK;
+            _tempDiagnostics.lastGoodPresent = true;
+            _tempDiagnostics.lastGoodC = t;
+            _tempDiagnostics.lastGoodMs = _tempDiagnostics.sampleMs;
         } else {
             _tempValid = false;
+            _tempDiagnostics.reason = (t == DEVICE_DISCONNECTED_C)
+                ? TemperatureReadReason::READ_FAILED
+                : TemperatureReadReason::OUT_OF_RANGE;
         }
+        _tempDiagnostics.valid = _tempValid;
         _temp.requestTemperatures();
         _lastTempRequest = millis();
+    }
+}
+
+const char* WaterSensors::temperatureReasonName(TemperatureReadReason reason) {
+    switch (reason) {
+        case TemperatureReadReason::OK: return "OK";
+        case TemperatureReadReason::READ_FAILED: return "READ_FAILED";
+        case TemperatureReadReason::OUT_OF_RANGE: return "OUT_OF_RANGE";
+        default: return "NO_SAMPLE";
     }
 }
 
@@ -145,6 +170,15 @@ bool WaterSensors::calibrateThreePoint(float v401, float v686, float v918) {
     return true;
 }
 
+const char* WaterSensors::calibrationSourceName(PhCalibrationSource source) {
+    switch (source) {
+        case PhCalibrationSource::NVS: return "NVS";
+        case PhCalibrationSource::FACTORY_DEFAULT: return "FACTORY_DEFAULT";
+        case PhCalibrationSource::FALLBACK: return "FALLBACK";
+        default: return "UNKNOWN";
+    }
+}
+
 bool WaterSensors::applyCapturedCalibration() {
     if (!_cap401 || !_cap686 || !_cap918) return false;
     return calibrateThreePoint(_vCap401, _vCap686, _vCap918);
@@ -186,7 +220,10 @@ bool WaterSensors::loadCalibration() {
             float v686 = prefs.getFloat(PH_NVS_V686, NAN);
             float v918 = prefs.getFloat(PH_NVS_V918, NAN);
             prefs.end();
-            if (calibrateThreePoint(v401, v686, v918)) return true;
+            if (calibrateThreePoint(v401, v686, v918)) {
+                _phCalSource = PhCalibrationSource::NVS;
+                return true;
+            }
         } else {
             prefs.end();
         }
@@ -195,8 +232,10 @@ bool WaterSensors::loadCalibration() {
     // No valid NVS yet — apply bench factory defaults, then persist them.
     if (!calibrateThreePoint(PH_CAL_V401, PH_CAL_V686, PH_CAL_V918)) {
         resetCalibration();
+        _phCalSource = PhCalibrationSource::FALLBACK;
         return false;
     }
+    _phCalSource = PhCalibrationSource::FACTORY_DEFAULT;
     saveCalibration();
     return true;
 }
@@ -234,15 +273,32 @@ float WaterSensors::phFromVoltageCalibrated(float volts, float tempC) const {
 
 WaterReading WaterSensors::readPh(float tempC) {
     WaterReading r = {NAN, false};
+    _phDiagnostics.sampledThisCall = false;
+    _phDiagnostics.qualityValid = false;
+    _phDiagnostics.sensorPh = NAN;
+    _phDiagnostics.sensorTempC = tempC;
+    _phDiagnostics.effectiveTempC = NAN;
+    _phDiagnostics.temperatureValid = false;
+    _phDiagnostics.reason = PhSampleReason::NO_SAMPLE;
     if (!_adsReady) {
         _lastPhVoltage = NAN;
+        _phDiagnostics.reason = PhSampleReason::ADS_UNAVAILABLE;
         return r;
     }
 
     const int16_t raw = _ads.readADC_SingleEnded(ADS_PH_CHANNEL);
     const float voltage = _ads.computeVolts(raw);
+    _phDiagnostics.sampleId++;
+    _phDiagnostics.sampleMs = millis();
+    _phDiagnostics.rawAdc = raw;
+    _phDiagnostics.voltage = voltage;
+    _phDiagnostics.samplePresent = true;
+    _phDiagnostics.sampledThisCall = true;
     _lastPhVoltage = voltage;
-    if (!isfinite(voltage) || voltage < 0.01f || voltage > 5.25f) return r;
+    if (!isfinite(voltage) || voltage < 0.01f || voltage > 5.25f) {
+        _phDiagnostics.reason = PhSampleReason::ADC_INVALID;
+        return r;
+    }
     // Keep a computed diagnostic value even outside the calibrated electrode
     // range. Quality remains false, but the quiet-window telemetry can report
     // what the ADC actually implies instead of silently replacing it with NAN.
@@ -254,11 +310,27 @@ WaterReading WaterSensors::readPh(float tempC) {
     // Keep the raw voltage for diagnosis. A publishable pH value still
     // requires a valid temperature; pH no longer participates in auto-spiral.
     const float tempForCalc = tempOk ? tempC : 25.0f;
+    _phDiagnostics.effectiveTempC = tempForCalc;
+    _phDiagnostics.temperatureValid = tempOk;
     float phValue = phFromVoltageCalibrated(voltage, tempForCalc);
-    if (!isfinite(phValue)) return r;
+    if (!isfinite(phValue)) {
+        _phDiagnostics.reason = PhSampleReason::COMPUTATION_INVALID;
+        return r;
+    }
     r.value = phValue;
     r.valid = electrodeOk && tempOk &&
               (phValue >= PH_PLAUSIBLE_MIN) && (phValue <= PH_PLAUSIBLE_MAX);
+    _phDiagnostics.sensorPh = phValue;
+    _phDiagnostics.qualityValid = r.valid;
+    if (!electrodeOk) {
+        _phDiagnostics.reason = PhSampleReason::ELECTRODE_RANGE;
+    } else if (!tempOk) {
+        _phDiagnostics.reason = PhSampleReason::TEMP_INVALID;
+    } else if (phValue < PH_PLAUSIBLE_MIN || phValue > PH_PLAUSIBLE_MAX) {
+        _phDiagnostics.reason = PhSampleReason::PH_IMPLAUSIBLE;
+    } else {
+        _phDiagnostics.reason = PhSampleReason::OK;
+    }
     return r;
 }
 
