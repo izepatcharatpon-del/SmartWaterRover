@@ -1376,10 +1376,32 @@ void test_grid_smoothing_preserves_final_drive_interlocks_and_resumes() {
     TEST_ASSERT_TRUE(tick().stopReason == DriveStopReason::HARD_STOP);
 }
 
+void test_continuous_grid_corner_still_passes_through_final_drive_reversal_and_estop() {
+    GridHeadingController heading;
+    DriveController drive(MOTOR_PWM_LIMIT, MOTOR_MIN_PWM, MOTOR_PWM_SLEW_PER_SEC);
+    DriveInterlocks locks{STATE_GRID_PATROL, SafetyState::NORMAL, false, true, false};
+    int oldLeft = 0, oldRight = 0;
+    for (unsigned i = 0; i < 200; ++i) {
+        const auto request = heading.update(100, i * .6f, GRID_CRUISE_PWM,
+                                            (i + 1) * 50000U, true);
+        const auto out = drive.resolve(request, locks, .05f);
+        TEST_ASSERT_TRUE(oldLeft * out.leftPwm >= 0);
+        TEST_ASSERT_TRUE(oldRight * out.rightPwm >= 0);
+        oldLeft = out.leftPwm; oldRight = out.rightPwm;
+    }
+    locks.emergencyPending = true;
+    const auto out = drive.resolve(heading.update(100, 100, GRID_CRUISE_PWM,
+        201 * 50000U, true), locks, .05f);
+    TEST_ASSERT_TRUE(out.stopReason == DriveStopReason::HARD_STOP);
+    TEST_ASSERT_EQUAL_INT(0, out.leftPwm);
+    TEST_ASSERT_EQUAL_INT(0, out.rightPwm);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_distance_latitude_step);
     RUN_TEST(test_grid_smoothing_preserves_final_drive_interlocks_and_resumes);
+    RUN_TEST(test_continuous_grid_corner_still_passes_through_final_drive_reversal_and_estop);
     RUN_TEST(test_distance_zero);
     RUN_TEST(test_bearing_due_north);
     RUN_TEST(test_bearing_due_east);

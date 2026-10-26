@@ -48,6 +48,7 @@ struct Rig {
             (in.distance<LOS_NEAR_SLOW_M?MOTOR_APPROACH_PWM:
                 (in.state==STATE_GRID_PATROL?GRID_CRUISE_PWM:
                     (in.state==STATE_SPIRAL_MAPPING?MOTOR_APPROACH_PWM:MOTOR_CRUISE_PWM)));
+        if(in.state==STATE_GRID_PATROL) row.base=GRID_CRUISE_PWM;
         row.request={DriveSource::NONE,0,0,false};
         const bool active=in.state==STATE_GRID_PATROL || in.state==STATE_SPIRAL_MAPPING || in.state==STATE_RTH;
         const bool available=in.fresh&&in.gps&&std::isfinite(in.heading);

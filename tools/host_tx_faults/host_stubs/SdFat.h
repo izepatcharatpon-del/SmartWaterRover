@@ -18,6 +18,9 @@
 #ifndef O_AT_END
 #define O_AT_END 0x80
 #endif
+#ifndef O_EXCL
+#define O_EXCL 0x100
+#endif
 #define T_ACCESS 0x01
 #define T_WRITE 0x02
 #define T_CREATE 0x04
@@ -99,6 +102,7 @@ private:
 class HostSdCard {
 public:
     uint8_t errorCode() const { return 0; }
+    uint32_t errorData() const { return 0; }
 };
 
 class SdSpiConfig {
@@ -115,7 +119,7 @@ public:
         const std::string name(path);
         if (HostTest::isTxPath(name) && HostTest::txUnavailable) return FsFile{};
         auto found = HostTest::files().find(name);
-        if (found != HostTest::files().end()) return FsFile(found->second);
+        if (found != HostTest::files().end()) return (flags & O_EXCL) ? FsFile{} : FsFile(found->second);
         if (!(flags & O_CREAT)) return FsFile{};
         auto entry = std::make_shared<HostTest::FileEntry>();
         entry->path = name;

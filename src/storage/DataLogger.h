@@ -100,6 +100,7 @@ public:
     bool logTxDiagnostic(const DiagnosticFormatting::TxLogRecord& rec);
     // IO owner only: append calls do not touch SD for main/pH rows.
     bool canAcceptLogPair() const;
+    bool appendRejectedRecord() const { return _appendInvalid; }
     bool service(); // At most one write/sync phase per IO iteration.
     size_t mainPendingBytes() const { return _mainBuffer.size(); }
     size_t phPendingBytes() const { return _phBuffer.size(); }
@@ -118,6 +119,12 @@ public:
     uint32_t writeFailCount() const { return _writeFailCount; }
     uint32_t txDiagnosticWriteFailCount() const { return _txDiagnosticWriteFailCount; }
     uint32_t phDiagnosticWriteFailCount() const { return _phDiagnosticWriteFailCount; }
+    uint32_t metadataWriteFailCount() const { return _metadataWriteFailCount; }
+    uint32_t recoveryAttempts() const { return _recoveryAttempts; }
+    uint32_t recoverySuccesses() const { return _recoverySuccesses; }
+    const char* faultStage() const { return _faultStage; }
+    uint8_t cardErrorCode() const { return _cardError; }
+    uint32_t cardErrorData() const { return _cardErrorData; }
     const char* filename() const { return _filename; }
 
 private:
@@ -128,14 +135,18 @@ private:
     uint32_t          _txDiagnosticWriteFailCount;
     uint32_t          _phDiagnosticWriteFailCount;
     bool              _fatCreateTimeSet;
-    char              _filename[24];
-    char              _txFilename[32];
-    char              _metadataFilename[32];
+    char              _filename[40];
+    char              _txFilename[56];
+    char              _metadataFilename[56];
+    char              _phFilename[56]{};
+    char              _baseFilename[40]{};
 
     static constexpr size_t MAIN_ROW_BYTES = 768;
     static constexpr size_t PH_ROW_BYTES = 512;
     FixedLogBuffer<SD_LOG_MAIN_BUFFER_BYTES> _mainBuffer;
     FixedLogBuffer<SD_LOG_PH_BUFFER_BYTES> _phBuffer;
+    FixedLogBuffer<SD_LOG_TX_BUFFER_BYTES> _txBuffer;
+    size_t _mainOffset = 0, _phOffset = 0, _txOffset = 0;
     enum class SyncPhase : uint8_t { NONE, MAIN_DATA, MAIN_SYNC, PH_DATA, PH_SYNC, TX_SYNC };
     SyncPhase _syncPhase = SyncPhase::NONE;
     size_t _commitMain = 0, _commitPh = 0;
@@ -149,7 +160,35 @@ private:
     uint8_t _commitMonth = 0, _commitDay = 0, _commitHour = 0, _commitMinute = 0, _commitSecond = 0;
     uint16_t _timeYear = 0;
     uint8_t _timeMonth = 0, _timeDay = 0, _timeHour = 0, _timeMinute = 0, _timeSecond = 0;
-    void openAndWriteHeader();
+    enum class RecoveryPhase : uint8_t {
+        NONE, WAIT, CLOSE_MAIN, CLOSE_PH, CLOSE_TX, UNMOUNT, CARD, VOLUME,
+        NAME, OPEN_MAIN, HEADER_MAIN, SYNC_MAIN, OPEN_PH, HEADER_PH,
+        SYNC_PH, OPEN_TX, HEADER_TX, SYNC_TX, METADATA, FINISH
+    };
+    RecoveryPhase _recoveryPhase = RecoveryPhase::NONE;
+    bool _configured = false, _recoveryRequested = false, _txStopped = false;
+    bool _appendInvalid = false, _haveRunNumber = false, _runEstablished = false;
+    enum class AuxPhase : uint8_t { NONE, CLOSE, OPEN, HEADER, SYNC, METADATA };
+    AuxPhase _auxPhase = AuxPhase::NONE;
+    bool _auxTx = false, _auxPreferTx = false, _auxYield = false;
+    uint32_t _auxPart = 0, _auxSince = 0, _auxDelay = SD_LOG_RECOVERY_RETRY_MS;
+    char _auxFilename[56]{}, _auxMetadataFilename[56]{};
+    bool auxiliaryStep(uint32_t now);
+    uint32_t _retrySince = 0, _retryDelay = SD_LOG_RECOVERY_RETRY_MS;
+    uint32_t _runNumber = 0, _recoveryAttempts = 0, _recoverySuccesses = 0;
+    uint32_t _metadataWriteFailCount = 0;
+    uint32_t _recoveryPart = 0;
+    uint32_t _spiHz = 400000, _lastAcceptedSequence = 0;
+    uint32_t _faultAt = 0, _faultSequence = 0, _cardErrorData = 0;
+    uint8_t _cardError = 0;
+    const char* _faultStage = "NONE";
+    float _calV401 = 0, _calV686 = 0, _calV918 = 0;
+    bool _calValid = false;
+    char _calSource[32]{};
+    bool openAndWriteHeader();
+    void requestRecovery(const char* stage, bool mainFailure);
+    bool recoveryStep(uint32_t now);
+    void setSidecarNames();
     uint32_t nextBootIndex();
     void writeMetadata(float calV401, float calV686, float calV918,
                        bool calValid, const char* calSource);

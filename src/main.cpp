@@ -225,7 +225,7 @@ void setup() {
     ctx.nav = &nav;
     ctx.spiralPlanner = &spiralPlanner; ctx.anomaly = &anomaly;
     ctx.link = &commsLink;
-    ctx.logger = loggerOk ? &logger : nullptr;
+    ctx.logger = &logger; // IO owns bounded retry even when startup SD is unavailable.
     ctx.wdt = &watchdog;
     ctx.safety = &safety; ctx.fsm = &fsm;
     ctx.batteryVoltage = VOLTAGE_FULL;

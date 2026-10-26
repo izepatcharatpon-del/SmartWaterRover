@@ -14,6 +14,8 @@ public:
     bool isTurningInPlace() const { return _turnInPlace; }
     float headingRateDegPerSec() const { return _rate; }
     float steeringPwm() const { return _steering; }
+    float surgePwm() const { return _surge; }
+    float integralPwm() const { return _integralPwm; }
 
 private:
     bool _haveSample;
@@ -23,6 +25,7 @@ private:
     float _rate;
     float _integralPwm;
     float _steering;
+    float _surge;
 };
 
 #endif // USV_GRID_HEADING_CONTROLLER_H

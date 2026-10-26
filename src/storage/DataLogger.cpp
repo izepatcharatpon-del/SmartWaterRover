@@ -144,19 +144,23 @@ uint32_t DataLogger::nextBootIndex() {
     return n;
 }
 
-void DataLogger::openAndWriteHeader() {
+bool DataLogger::openAndWriteHeader() {
     bool isNew = !g_sd.exists(_filename);
-    g_logFile = g_sd.open(_filename, O_RDWR | O_CREAT | O_AT_END);
+    if (!isNew) return false; // Never append a fresh run to an existing/uncertain session.
+    g_logFile = g_sd.open(_filename, O_RDWR | O_CREAT | O_EXCL);
     if (g_logFile && isNew) {
-        g_logFile.print(CSV_HEADER);
-        g_logFile.flush();
+        if (g_logFile.print(CSV_HEADER) != strlen(CSV_HEADER) || !g_logFile.sync()) return false;
     }
+    return (bool)g_logFile;
 }
 
 bool DataLogger::begin(float calV401, float calV686, float calV918,
                        bool calValid, const char* calSource) {
+    _calV401 = calV401; _calV686 = calV686; _calV918 = calV918; _calValid = calValid;
+    snprintf(_calSource, sizeof(_calSource), "%s", calSource ? calSource : "UNKNOWN");
     _spiMutex = xSemaphoreCreateMutex();
     if (!_spiMutex) return false;
+    _configured = true;
 
     pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);
@@ -181,16 +185,18 @@ bool DataLogger::begin(float calV401, float calV686, float calV918,
             continue;
         }
         if (g_sd.volumeBegin()) {
+            _spiHz = kHzList[i];
             mounted = true;
         }
     }
 
     if (!mounted) {
-        _ready = false;
+        requestRecovery("MOUNT", true);
         return false;
     }
 
     const uint32_t boot = nextBootIndex();
+    _runNumber = boot ? boot : (uint32_t)millis(); _haveRunNumber = true;
     if (boot == 0) {
         snprintf(_filename, sizeof(_filename), "/m_t%lu.csv",
                  (unsigned long)millis());
@@ -198,27 +204,34 @@ bool DataLogger::begin(float calV401, float calV686, float calV918,
         snprintf(_filename, sizeof(_filename), "/m_%05lu.csv",
                  (unsigned long)boot);
     }
-    openAndWriteHeader();
-    snprintf(_txFilename, sizeof(_txFilename), "%s.tx.csv", _filename);
-    snprintf(_metadataFilename, sizeof(_metadataFilename), "%s.meta.txt", _filename);
-    char phName[32];
-    snprintf(phName, sizeof(phName), "%s.ph.csv", _filename);
-    const bool phDiagIsNew = !g_sd.exists(phName);
-    g_phDiagFile = g_sd.open(phName, O_RDWR | O_CREAT | O_AT_END);
-    if (!g_phDiagFile || (phDiagIsNew && g_phDiagFile.print(PH_DIAG_HEADER) == 0)) {
+    snprintf(_baseFilename, sizeof(_baseFilename), "%s", _filename);
+    setSidecarNames();
+    if (g_sd.exists(_phFilename) || g_sd.exists(_txFilename) || g_sd.exists(_metadataFilename)) {
+        requestRecovery("NAME_COLLISION", true); return false;
+    }
+    if (!openAndWriteHeader()) {
+        requestRecovery("MAIN_HEADER", true);
+        return false;
+    }
+    // The first successfully created main file anchors this boot's logical run.
+    snprintf(_baseFilename, sizeof(_baseFilename), "%s", _filename);
+    _runEstablished = true;
+    setSidecarNames();
+    g_phDiagFile = g_sd.open(_phFilename, O_RDWR | O_CREAT | O_EXCL);
+    if (!g_phDiagFile || g_phDiagFile.print(PH_DIAG_HEADER) != strlen(PH_DIAG_HEADER) || !g_phDiagFile.sync()) {
         _phDiagnosticWriteFailCount++;
         g_phDiagFile.close();
         Serial.println(F("[USV] pH diagnostic sidecar unavailable"));
     }
-    const bool txDiagIsNew = !g_sd.exists(_txFilename);
-    g_txDiagFile = g_sd.open(_txFilename, O_RDWR | O_CREAT | O_AT_END);
-    if (!g_txDiagFile || (txDiagIsNew && g_txDiagFile.print(TX_DIAG_HEADER) == 0)) {
+    g_txDiagFile = g_sd.open(_txFilename, O_RDWR | O_CREAT | O_EXCL);
+    if (!g_txDiagFile || g_txDiagFile.print(TX_DIAG_HEADER) != strlen(TX_DIAG_HEADER) || !g_txDiagFile.sync()) {
         _txDiagnosticWriteFailCount++;
         g_txDiagFile.close();
         Serial.println(F("[USV] TX diagnostic sidecar unavailable"));
     }
+    _phStopped = !g_phDiagFile; _txStopped = !g_txDiagFile;
+    _auxSince = (uint32_t)millis();
     writeMetadata(calV401, calV686, calV918, calValid, calSource);
-    g_spi.endTransaction();
     _ready = (bool)g_logFile;
     _lastFlush = millis();
     _lastSyncCompleted = millis();
@@ -229,33 +242,41 @@ bool DataLogger::begin(float calV401, float calV686, float calV918,
 
 void DataLogger::writeMetadata(float calV401, float calV686, float calV918,
                                bool calValid, const char* calSource) {
-    const bool isNew = !g_sd.exists(_metadataFilename);
-    FsFile metadata = g_sd.open(_metadataFilename, O_RDWR | O_CREAT | O_AT_END);
+    FsFile metadata = g_sd.open(_metadataFilename, O_RDWR | O_CREAT | O_EXCL);
     if (!metadata) {
-        Serial.println(F("[USV] diagnostic metadata unavailable"));
-        return;
+        ++_metadataWriteFailCount;
+        Serial.println(F("[SD] metadata open failed; main logging continues")); return;
     }
-    if (isNew) {
-        metadata.printf("schema=%s\nrun_id=%s\nfirmware_build_id=%s\n",
-                        USV_DIAGNOSTIC_SCHEMA, _filename, USV_BUILD_ID);
-        metadata.println("build_id_inputs=dirty bytes under include/ and src/, platformio.ini, tools/build_identity.py; SHA-256 truncated to 16 hex chars");
-        metadata.printf("ph_cal_source_at_boot=%s\nph_cal_valid_at_boot=%u\n",
-                        calSource ? calSource : "UNKNOWN", calValid ? 1U : 0U);
-        metadata.printf("ph_cal_v401=%.6f\nph_cal_v686=%.6f\nph_cal_v918=%.6f\n",
-                        (double)calV401, (double)calV686, (double)calV918);
-        metadata.println("per_sample_calibration_provenance=UNKNOWN (no synchronization or conversion semantics changed)");
-        metadata.println("utc_source=GPS date+time; available only under existing utcNow validity/freshness policy; boot_ms always retained");
-        metadata.println("ph_sidecar_rows=SD navigation rows; repeated ph_sample_id means repeated observation, not a new ADC conversion");
-        metadata.println("tx_sidecar_rows=one per sendTelemetry call; sequence is packet sequence; MAC ACK is not application ingestion");
-        metadata.println("legacy_csv=unchanged column order and meaning");
-        metadata.flush();
+    char text[2048];
+    const int length=snprintf(text,sizeof(text),
+        "schema=%s\nrun_id=%s\nfirmware_build_id=%s\n"
+        "build_id_inputs=dirty bytes under include/ and src/, platformio.ini, tools/build_identity.py; SHA-256 truncated to 16 hex chars\n"
+        "ph_cal_source_at_boot=%s\nph_cal_valid_at_boot=%u\n"
+        "ph_cal_v401=%.6f\nph_cal_v686=%.6f\nph_cal_v918=%.6f\n"
+        "parent_run=%s\nrecovery_part=%u\nph_file=%s\ntx_file=%s\n"
+        "fault_stage=%s\nfault_ms=%lu\nfault_sd_seq=%lu\ncard_error=%u\ncard_error_data=%lu\n"
+        "per_sample_calibration_provenance=UNKNOWN (no conversion semantics changed)\n"
+        "utc_source=GPS date+time; available only under existing utcNow validity/freshness policy; boot_ms always retained\n"
+        "ph_sidecar_rows=SD navigation rows; repeated ph_sample_id means repeated observation, not a new ADC conversion\n"
+        "tx_sidecar_rows=one per sendTelemetry call; sequence is packet sequence; MAC ACK is not application ingestion\n"
+        "legacy_csv=unchanged column order and meaning\n"
+        "recovery_rule=unconfirmed records replayed with original identities; old file tail is uncertain; reconcile by seq\n",
+        USV_DIAGNOSTIC_SCHEMA,_filename,USV_BUILD_ID,
+        calSource?calSource:"UNKNOWN",calValid?1U:0U,(double)calV401,(double)calV686,(double)calV918,
+        _baseFilename,(unsigned)_recoveryPart,_phFilename,_txFilename,_faultStage,(unsigned long)_faultAt,
+        (unsigned long)_faultSequence,(unsigned)_cardError,(unsigned long)_cardErrorData);
+    const bool ok=length>0 && (size_t)length<sizeof(text) &&
+        metadata.print(text)==(size_t)length && metadata.sync();
+    if(!ok) {
+        ++_metadataWriteFailCount;
+        Serial.println(F("[SD] metadata write/sync failed; fault context retained in RAM"));
     }
 }
 
 bool DataLogger::logPhDiagnostic(
     uint32_t bootMs, uint32_t sdSequence,
     const DiagnosticFormatting::PhLogRecord& rec) {
-    if (_phStopped || !g_phDiagFile || !_spiMutex ||
+    if (!_configured || !_spiMutex ||
         xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
         _phDiagnosticWriteFailCount++;
         return false;
@@ -275,22 +296,29 @@ bool DataLogger::logPhDiagnostic(
 }
 
 bool DataLogger::logTxDiagnostic(const DiagnosticFormatting::TxLogRecord& rec) {
-    if (!g_txDiagFile || !_spiMutex ||
-        xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-        _txDiagnosticWriteFailCount++;
-        return false;
+    if (!_configured || !_spiMutex || xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        ++_txDiagnosticWriteFailCount; return false;
     }
     char row[320];
     bool ok = DiagnosticFormatting::formatTxCsvRow(rec, row, sizeof(row));
     const size_t length = ok ? strlen(row) : 0;
-    ok = ok && g_txDiagFile.print(row) == length;
-    if (!ok) _txDiagnosticWriteFailCount++;
-    xSemaphoreGive(_spiMutex);
-    return ok;
+    const size_t before = _txBuffer.size();
+    ok = ok && _txBuffer.append(row, length, millis());
+    if (ok && _ready && !_txStopped && !_recoveryRequested && g_txDiagFile && _txOffset == before) {
+        ok = g_txDiagFile.print(row) == length;
+        if (ok) _txOffset += length;
+        else { _txStopped = true; requestRecovery("TX_WRITE", false); }
+    } else if (ok && _ready && (!g_txDiagFile || _txStopped)) {
+        // Buffered for a new session; never join the next packet to a partial row.
+        ok = false;
+    }
+    if (!ok) ++_txDiagnosticWriteFailCount;
+    xSemaphoreGive(_spiMutex); return ok;
 }
 
 bool DataLogger::logRecord(const SdLogRecord& rec) {
-    if (!_ready || !g_logFile) return false;
+    _appendInvalid = false;
+    if (!_configured || !_spiMutex) return false;
     if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
     char row[MAIN_ROW_BYTES];
     SdDateTime local = {};
@@ -399,16 +427,16 @@ bool DataLogger::logRecord(const SdLogRecord& rec) {
     const bool ok = written > 0 && (size_t)written < sizeof(row) &&
         _mainBuffer.append(row, (size_t)written, millis());
     if (ok) {
-        ++_mainAccepted;
+        ++_mainAccepted; _lastAcceptedSequence = rec.sequence_number;
         _haveTimestamp = localValid;
         if (localValid) {
             _haveTimestamp = true;
             _timeYear = local.year; _timeMonth = local.month; _timeDay = local.day;
             _timeHour = local.hour; _timeMinute = local.minute; _timeSecond = local.second;
         }
-    } else {
-        ++_writeFailCount;
-        _ready = false;
+    } else if (written <= 0 || (size_t)written >= sizeof(row)) {
+        // A malformed record is rejected explicitly; it must not poison the disk state.
+        ++_writeFailCount; _appendInvalid = true;
     }
     xSemaphoreGive(_spiMutex);
     return ok;
@@ -419,30 +447,51 @@ static_assert(SD_LOG_MAIN_BUFFER_BYTES >= SD_LOG_WRITE_BYTES, "main buffer too s
 static_assert(SD_LOG_PH_BUFFER_BYTES >= SD_LOG_WRITE_BYTES, "pH buffer too small");
 
 bool DataLogger::canAcceptLogPair() const {
-    return _ready && _mainBuffer.freeBytes() >= MAIN_ROW_BYTES &&
-          (_phStopped || !g_phDiagFile || _phBuffer.freeBytes() >= PH_ROW_BYTES);
+    return _configured && _mainBuffer.freeBytes() >= MAIN_ROW_BYTES &&
+          (_phStopped || _phBuffer.freeBytes() >= PH_ROW_BYTES);
 }
 
 template <size_t Capacity>
 static bool writeLogChunk(FsFile& file, FixedLogBuffer<Capacity>& buffer,
-                          size_t limit, uint32_t& rows, size_t& consumed) {
-    consumed = buffer.prefix(limit < SD_LOG_WRITE_BYTES ? limit : SD_LOG_WRITE_BYTES);
+                          size_t limit, uint32_t& rows, size_t& offset, size_t& consumed) {
+    if (offset > buffer.size()) return false;
+    const size_t available = buffer.size() - offset;
+    consumed = available < limit ? available : limit;
+    if (consumed > SD_LOG_WRITE_BYTES) consumed = SD_LOG_WRITE_BYTES;
+    const char* data = buffer.data() + offset;
+    while (consumed && data[consumed - 1] != '\n') --consumed;
     if (!consumed) return false;
-    if (file.write((const uint8_t*)buffer.data(), consumed) != consumed) return false;
-    for (size_t i = 0; i < consumed; ++i) if (buffer.data()[i] == '\n') ++rows;
-    return buffer.consume(consumed);
+    if (file.write((const uint8_t*)data, consumed) != consumed) return false;
+    for (size_t i=0; i<consumed; ++i) if (data[i]=='\n') ++rows;
+    offset += consumed;
+    // Retain the entire unconfirmed prefix until sync succeeds.
+    return true;
 }
 
 bool DataLogger::service() {
-    if (!_ready || !_spiMutex) return false;
+    if (!_configured || !_spiMutex) return false;
     const uint32_t started = millis();
-    if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
+    if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(50)) != pdTRUE) return true;
+    if (_recoveryRequested || _recoveryPhase != RecoveryPhase::NONE) {
+        const bool recovered = recoveryStep(started);
+        const uint32_t elapsed=(uint32_t)((uint32_t)millis()-started);
+        if(elapsed>_maxServiceMs) _maxServiceMs=elapsed;
+        xSemaphoreGive(_spiMutex); return recovered;
+    }
+    if (!_ready) { xSemaphoreGive(_spiMutex); return false; }
+    // Auxiliary retries share this IO owner and yield between phases. Never
+    // remount or pause the main stream just because one sidecar stays unavailable.
+    if (_syncPhase == SyncPhase::NONE && auxiliaryStep(started)) {
+        const uint32_t elapsed=(uint32_t)((uint32_t)millis()-started);
+        if(elapsed>_maxServiceMs) _maxServiceMs=elapsed;
+        xSemaphoreGive(_spiMutex); return true;
+    }
     bool ok = true;
     size_t consumed = 0;
     if (_syncPhase == SyncPhase::NONE &&
         (uint32_t)(started - _lastFlush) >= SD_LOG_SYNC_INTERVAL_MS) {
         // Freeze this commit's byte boundary; later rows remain for the next commit.
-        _commitMain = _mainBuffer.size(); _commitPh = _phBuffer.size();
+        _commitMain = _mainBuffer.size() - _mainOffset; _commitPh = _phBuffer.size() - _phOffset;
         _commitStart = started; _syncPhase = SyncPhase::MAIN_DATA;
         _commitSyncOk = !_phStopped;
         _commitHasTimestamp = _haveTimestamp;
@@ -452,7 +501,7 @@ bool DataLogger::service() {
     switch (_syncPhase) {
         case SyncPhase::MAIN_DATA:
             if (_commitMain) {
-                ok = writeLogChunk(g_logFile, _mainBuffer, _commitMain, _mainWritten, consumed);
+                ok = writeLogChunk(g_logFile, _mainBuffer, _commitMain, _mainWritten, _mainOffset, consumed);
                 if (ok) _commitMain -= consumed;
             }
             if (!_commitMain) _syncPhase = SyncPhase::MAIN_SYNC;
@@ -465,33 +514,51 @@ bool DataLogger::service() {
             }
             // SdFat timestamp() already syncs the file and directory cache.
             if (!_commitHasTimestamp) ok = g_logFile.sync();
-            if (ok) { _mainSynced = _mainWritten; _syncPhase = SyncPhase::PH_DATA; }
+            if (ok) {
+                _mainSynced = _mainWritten;
+                if (_mainOffset) _mainBuffer.consume(_mainOffset);
+                _mainOffset = 0; _syncPhase = SyncPhase::PH_DATA;
+            }
             break;
         case SyncPhase::PH_DATA:
             if (_phStopped) _commitPh = 0;
             if (_commitPh) {
-                ok = writeLogChunk(g_phDiagFile, _phBuffer, _commitPh, _phWritten, consumed);
+                ok = writeLogChunk(g_phDiagFile, _phBuffer, _commitPh, _phWritten, _phOffset, consumed);
                 if (ok) _commitPh -= consumed;
                 else {
                     // Retain the failed bytes for diagnosis; never retry a partial row.
                     // Future pH rows are rejected/count failures without blocking main.
                     ++_phDiagnosticWriteFailCount;
                     _phStopped = true; _commitSyncOk = false; _commitPh = 0;
-                    ok = true;
+                    requestRecovery("PH_WRITE", false); ok = true;
                 }
             }
             if (!_commitPh) _syncPhase = SyncPhase::PH_SYNC;
             break;
         case SyncPhase::PH_SYNC:
             if (!_phStopped && g_phDiagFile) {
-                if (g_phDiagFile.sync()) _phSynced = _phWritten;
-                else { ++_phDiagnosticWriteFailCount; _phStopped = true; _commitSyncOk = false; }
+                if (g_phDiagFile.sync()) {
+                    _phSynced = _phWritten;
+                    if (_phOffset) _phBuffer.consume(_phOffset);
+                    _phOffset = 0;
+                } else { ++_phDiagnosticWriteFailCount; _phStopped = true; _commitSyncOk = false;
+                    requestRecovery("PH_SYNC", false); }
             }
             _syncPhase = SyncPhase::TX_SYNC;
             break;
         case SyncPhase::TX_SYNC:
-            if (g_txDiagFile && !g_txDiagFile.sync()) {
-                ++_txDiagnosticWriteFailCount; _commitSyncOk = false;
+            if (g_txDiagFile && !_txStopped) {
+                if (!_txStopped && _txOffset < _txBuffer.size()) {
+                    uint32_t ignoredRows = 0;
+                    ok = writeLogChunk(g_txDiagFile, _txBuffer, _txBuffer.size()-_txOffset,
+                                       ignoredRows, _txOffset, consumed);
+                    if (!ok) { ++_txDiagnosticWriteFailCount; requestRecovery("TX_REPLAY", false); }
+                    break;
+                }
+                if (!g_txDiagFile.sync()) {
+                    ++_txDiagnosticWriteFailCount; _commitSyncOk = false;
+                    requestRecovery("TX_SYNC", false);
+                } else { if (_txOffset) _txBuffer.consume(_txOffset); _txOffset = 0; }
             }
             {
                 const uint32_t gap = (uint32_t)(millis() - _lastSyncCompleted);
@@ -502,22 +569,25 @@ bool DataLogger::service() {
             }
             break;
         case SyncPhase::NONE: {
-            const bool mainDue = _mainBuffer.size() >= SD_LOG_MIN_BATCH_BYTES ||
-                (_mainBuffer.size() && _mainBuffer.age(started) >= SD_LOG_MAX_BATCH_AGE_MS);
-            const bool phDue = !_phStopped && (_phBuffer.size() >= SD_LOG_MIN_BATCH_BYTES ||
-                (_phBuffer.size() && _phBuffer.age(started) >= SD_LOG_MAX_BATCH_AGE_MS));
+            const size_t mainUnwritten = _mainBuffer.size() - _mainOffset;
+            const size_t phUnwritten = _phBuffer.size() - _phOffset;
+            const bool mainDue = mainUnwritten && (mainUnwritten >= SD_LOG_MIN_BATCH_BYTES ||
+                _mainBuffer.age(started) >= SD_LOG_MAX_BATCH_AGE_MS);
+            const bool phDue = !_phStopped && phUnwritten && (phUnwritten >= SD_LOG_MIN_BATCH_BYTES ||
+                _phBuffer.age(started) >= SD_LOG_MAX_BATCH_AGE_MS);
             if (phDue && (_nextPh || !mainDue)) {
-                ok = writeLogChunk(g_phDiagFile, _phBuffer, _phBuffer.size(), _phWritten, consumed);
-                if (!ok) { ++_phDiagnosticWriteFailCount; _phStopped = true; ok = true; }
+                ok = writeLogChunk(g_phDiagFile, _phBuffer, _phBuffer.size() - _phOffset, _phWritten, _phOffset, consumed);
+                if (!ok) { ++_phDiagnosticWriteFailCount; _phStopped = true;
+                    requestRecovery("PH_WRITE", false); ok = true; }
                 _nextPh = false;
             } else if (mainDue) {
-                ok = writeLogChunk(g_logFile, _mainBuffer, _mainBuffer.size(), _mainWritten, consumed);
+                ok = writeLogChunk(g_logFile, _mainBuffer, _mainBuffer.size() - _mainOffset, _mainWritten, _mainOffset, consumed);
                 _nextPh = true;
             }
             break;
         }
     }
-    if (!ok) { ++_writeFailCount; _ready = false; }
+    if (!ok) { requestRecovery(_syncPhase == SyncPhase::MAIN_SYNC ? "MAIN_SYNC" : "MAIN_WRITE", true); _ready = false; }
     const uint32_t elapsed = (uint32_t)(millis() - started);
     if (elapsed > _maxServiceMs) _maxServiceMs = elapsed;
     xSemaphoreGive(_spiMutex);
@@ -527,11 +597,201 @@ bool DataLogger::service() {
 bool DataLogger::checkIntegrity() {
     if (!_spiMutex) return false;
     if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
-    bool cardOk = g_sd.card() && g_sd.card()->errorCode() == 0;
-    bool ok = cardOk && (bool)g_logFile && _ready;
-    if (!ok) {
-        _ready = false;
+    // SdFat errorCode() is a retained LAST error, not a new card-health probe.
+    // Actual checked write/sync results drive recovery and preserve the evidence.
+    const bool ok = _ready && (bool)g_logFile;
+    if (_ready && !g_logFile) requestRecovery("FILE_CLOSED", true);
+    xSemaphoreGive(_spiMutex); return ok;
+}
+
+void DataLogger::setSidecarNames() {
+    snprintf(_phFilename, sizeof(_phFilename), "%s.ph.csv", _filename);
+    snprintf(_txFilename, sizeof(_txFilename), "%s.tx.csv", _filename);
+    snprintf(_metadataFilename, sizeof(_metadataFilename), "%s.meta.txt", _filename);
+}
+
+void DataLogger::requestRecovery(const char* stage, bool mainFailure) {
+    if (mainFailure) ++_writeFailCount;
+    if (!_recoveryRequested && _recoveryPhase == RecoveryPhase::NONE) {
+        _faultStage = stage; _faultAt = (uint32_t)millis(); _faultSequence = _lastAcceptedSequence;
+        _cardError = g_sd.card() ? g_sd.card()->errorCode() : 0;
+        _cardErrorData = g_sd.card() ? g_sd.card()->errorData() : 0;
+        Serial.printf("[SD] fault stage=%s ms=%lu seq=%lu code=%u data=%lu; buffering for recovery\n",
+            _faultStage, (unsigned long)_faultAt, (unsigned long)_faultSequence,
+            (unsigned)_cardError, (unsigned long)_cardErrorData);
     }
-    xSemaphoreGive(_spiMutex);
+    _recoveryRequested = true;
+}
+
+bool DataLogger::recoveryStep(uint32_t now) {
+    if (_recoveryPhase == RecoveryPhase::NONE) {
+        _ready = false; _retrySince = now; _recoveryPhase = RecoveryPhase::WAIT;
+        _auxPhase = AuxPhase::NONE;
+        _mainOffset = _phOffset = _txOffset = 0;
+        _mainWritten = _mainSynced; _phWritten = _phSynced;
+        _syncPhase = SyncPhase::NONE; _commitMain = _commitPh = 0;
+    }
+    bool ok = true;
+    // One phase per IO iteration. Vendor operations still need real-card latency validation.
+    switch (_recoveryPhase) {
+        case RecoveryPhase::WAIT:
+            if ((uint32_t)(now-_retrySince) >= _retryDelay) {
+                ++_recoveryAttempts; _recoveryPhase = RecoveryPhase::CLOSE_MAIN;
+            }
+            break;
+        case RecoveryPhase::CLOSE_MAIN: g_logFile.close(); _recoveryPhase=RecoveryPhase::CLOSE_PH; break;
+        case RecoveryPhase::CLOSE_PH: g_phDiagFile.close(); _recoveryPhase=RecoveryPhase::CLOSE_TX; break;
+        case RecoveryPhase::CLOSE_TX: g_txDiagFile.close(); _recoveryPhase=RecoveryPhase::UNMOUNT; break;
+        case RecoveryPhase::UNMOUNT: g_sd.end(); _recoveryPhase=RecoveryPhase::CARD; break;
+        case RecoveryPhase::CARD:
+            ok=g_sd.cardBegin(SdSpiConfig(SD_CS_PIN, SHARED_SPI, _spiHz, &g_spi));
+            if(ok) _recoveryPhase=RecoveryPhase::VOLUME; break;
+        case RecoveryPhase::VOLUME:
+            ok=g_sd.volumeBegin(); if(ok) _recoveryPhase=RecoveryPhase::NAME; break;
+        case RecoveryPhase::NAME: {
+            if (!_haveRunNumber) {
+                const uint32_t boot=nextBootIndex(); _runNumber=boot?boot:now; _haveRunNumber=true;
+                snprintf(_baseFilename,sizeof(_baseFilename),"/m_%05lu.csv",(unsigned long)_runNumber);
+            }
+            ++_recoveryPart;
+            if (!_recoveryPart) ++_recoveryPart;
+            const int length=snprintf(_filename,sizeof(_filename),"/m_%05lu_r%03lu.csv",
+                (unsigned long)_runNumber,(unsigned long)_recoveryPart);
+            ok=length>0 && (size_t)length<sizeof(_filename);
+            if(ok) {
+                setSidecarNames();
+                if(!g_sd.exists(_filename) && !g_sd.exists(_phFilename) &&
+                   !g_sd.exists(_txFilename) && !g_sd.exists(_metadataFilename))
+                    _recoveryPhase=RecoveryPhase::OPEN_MAIN;
+            }
+            break;
+        }
+        case RecoveryPhase::OPEN_MAIN:
+            g_logFile=g_sd.open(_filename,O_RDWR|O_CREAT|O_EXCL);
+            ok=(bool)g_logFile; if(ok)_recoveryPhase=RecoveryPhase::HEADER_MAIN; break;
+        case RecoveryPhase::HEADER_MAIN:
+            ok=g_logFile.print(CSV_HEADER)==strlen(CSV_HEADER); if(ok)_recoveryPhase=RecoveryPhase::SYNC_MAIN; break;
+        case RecoveryPhase::SYNC_MAIN:
+            ok=g_logFile.sync();
+            if(ok) {
+                if (!_runEstablished) {
+                    snprintf(_baseFilename,sizeof(_baseFilename),"%s",_filename);
+                    _runEstablished=true;
+                }
+                _recoveryPhase=RecoveryPhase::OPEN_PH;
+            }
+            break;
+        case RecoveryPhase::OPEN_PH:
+            _phStopped=true;
+            g_phDiagFile=g_sd.open(_phFilename,O_RDWR|O_CREAT|O_EXCL);
+            if(g_phDiagFile) _recoveryPhase=RecoveryPhase::HEADER_PH;
+            else { ++_phDiagnosticWriteFailCount; _recoveryPhase=RecoveryPhase::OPEN_TX; }
+            break;
+        case RecoveryPhase::HEADER_PH:
+            if(g_phDiagFile.print(PH_DIAG_HEADER)==strlen(PH_DIAG_HEADER)) _recoveryPhase=RecoveryPhase::SYNC_PH;
+            else { ++_phDiagnosticWriteFailCount; g_phDiagFile.close(); _recoveryPhase=RecoveryPhase::OPEN_TX; }
+            break;
+        case RecoveryPhase::SYNC_PH:
+            if(g_phDiagFile.sync()) _phStopped=false;
+            else { ++_phDiagnosticWriteFailCount; g_phDiagFile.close(); }
+            _recoveryPhase=RecoveryPhase::OPEN_TX; break;
+        case RecoveryPhase::OPEN_TX:
+            _txStopped=true;
+            g_txDiagFile=g_sd.open(_txFilename,O_RDWR|O_CREAT|O_EXCL);
+            if(g_txDiagFile) _recoveryPhase=RecoveryPhase::HEADER_TX;
+            else { ++_txDiagnosticWriteFailCount; _recoveryPhase=RecoveryPhase::METADATA; }
+            break;
+        case RecoveryPhase::HEADER_TX:
+            if(g_txDiagFile.print(TX_DIAG_HEADER)==strlen(TX_DIAG_HEADER)) _recoveryPhase=RecoveryPhase::SYNC_TX;
+            else { ++_txDiagnosticWriteFailCount; g_txDiagFile.close(); _recoveryPhase=RecoveryPhase::METADATA; }
+            break;
+        case RecoveryPhase::SYNC_TX:
+            if(g_txDiagFile.sync()) _txStopped=false;
+            else { ++_txDiagnosticWriteFailCount; g_txDiagFile.close(); }
+            _recoveryPhase=RecoveryPhase::METADATA; break;
+        case RecoveryPhase::METADATA:
+            writeMetadata(_calV401,_calV686,_calV918,_calValid,_calSource);
+            _recoveryPhase=RecoveryPhase::FINISH; break;
+        case RecoveryPhase::FINISH:
+            _ready=true; _recoveryRequested=false;
+            _recoveryPhase=RecoveryPhase::NONE; _lastFlush=now; _fatCreateTimeSet=false;
+            _retryDelay=SD_LOG_RECOVERY_RETRY_MS; ++_recoverySuccesses;
+            _auxSince=now; _auxDelay=SD_LOG_RECOVERY_RETRY_MS; _auxYield=false;
+            Serial.printf("[SD] recovered file=%s original=%s successes=%lu\n",
+                _filename,_baseFilename,(unsigned long)_recoverySuccesses); break;
+        case RecoveryPhase::NONE: break;
+    }
+    if (!ok) {
+        _ready=false; _retrySince=(uint32_t)millis(); _recoveryPhase=RecoveryPhase::WAIT;
+        const uint32_t next=_retryDelay*2;
+        _retryDelay=next<SD_LOG_RECOVERY_MAX_RETRY_MS?next:SD_LOG_RECOVERY_MAX_RETRY_MS;
+    }
     return ok;
+}
+
+
+bool DataLogger::auxiliaryStep(uint32_t now) {
+    if (_auxYield) { _auxYield=false; return false; }
+    if (_auxPhase == AuxPhase::NONE) {
+        if ((!_phStopped && !_txStopped) || (uint32_t)(now-_auxSince)<_auxDelay) return false;
+        _auxTx = _txStopped && (!_phStopped || _auxPreferTx);
+        _auxPreferTx = !_auxTx;
+        ++_auxPart; if (!_auxPart) ++_auxPart;
+        const int length=snprintf(_auxFilename,sizeof(_auxFilename),"%s.a%lu.%s.csv",
+            _filename,(unsigned long)_auxPart,_auxTx?"tx":"ph");
+        const int metaLength=snprintf(_auxMetadataFilename,sizeof(_auxMetadataFilename),"%s.a%lu.meta.txt",
+            _filename,(unsigned long)_auxPart);
+        if(length<=0 || (size_t)length>=sizeof(_auxFilename) || metaLength<=0 || (size_t)metaLength>=sizeof(_auxMetadataFilename)) {
+            _auxSince=now; _auxDelay=SD_LOG_RECOVERY_MAX_RETRY_MS; return false;
+        }
+        _auxPhase=AuxPhase::CLOSE;
+    }
+    FsFile& file=_auxTx?g_txDiagFile:g_phDiagFile;
+    bool ok=true;
+    switch(_auxPhase) {
+        case AuxPhase::CLOSE:
+            file.close(); _auxPhase=AuxPhase::OPEN; break;
+        case AuxPhase::OPEN:
+            file=g_sd.open(_auxFilename,O_RDWR|O_CREAT|O_EXCL);
+            ok=(bool)file; if(ok)_auxPhase=AuxPhase::HEADER; break;
+        case AuxPhase::HEADER: {
+            const char* header=_auxTx?TX_DIAG_HEADER:PH_DIAG_HEADER;
+            ok=file.print(header)==strlen(header); if(ok)_auxPhase=AuxPhase::SYNC; break;
+        }
+        case AuxPhase::SYNC:
+            ok=file.sync();
+            if(ok) {
+                if(_auxTx) {
+                    snprintf(_txFilename,sizeof(_txFilename),"%s",_auxFilename);
+                    _txOffset=0; _txStopped=false;
+                } else {
+                    snprintf(_phFilename,sizeof(_phFilename),"%s",_auxFilename);
+                    _phOffset=0; _phWritten=_phSynced; _phStopped=false;
+                }
+                _auxPhase=AuxPhase::METADATA;
+            }
+            break;
+        case AuxPhase::METADATA: {
+            // Fresh provenance file links this repaired sidecar to the same run.
+            char saved[sizeof(_metadataFilename)];
+            snprintf(saved,sizeof(saved),"%s",_metadataFilename);
+            snprintf(_metadataFilename,sizeof(_metadataFilename),"%s",_auxMetadataFilename);
+            writeMetadata(_calV401,_calV686,_calV918,_calValid,_calSource);
+            snprintf(_metadataFilename,sizeof(_metadataFilename),"%s",saved);
+            Serial.printf("[SD] auxiliary restored file=%s parent=%s\n",_auxFilename,_baseFilename);
+            _auxPhase=AuxPhase::NONE; _auxSince=(uint32_t)millis(); _auxDelay=SD_LOG_RECOVERY_RETRY_MS;
+            break;
+        }
+        case AuxPhase::NONE: break;
+    }
+    if(!ok) {
+        if(_auxTx) ++_txDiagnosticWriteFailCount; else ++_phDiagnosticWriteFailCount;
+        // Leave the stream stopped, retaining its unconfirmed RAM journal.
+        // CLOSE occurs in its own phase on the next bounded attempt.
+        _auxPhase=AuxPhase::NONE; _auxSince=(uint32_t)millis();
+        const uint32_t next=_auxDelay*2;
+        _auxDelay=next<SD_LOG_RECOVERY_MAX_RETRY_MS?next:SD_LOG_RECOVERY_MAX_RETRY_MS;
+    }
+    _auxYield=true;
+    return true;
 }

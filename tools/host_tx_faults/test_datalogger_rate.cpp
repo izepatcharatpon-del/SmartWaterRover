@@ -119,11 +119,17 @@ int main(int argc, char** argv) {
     HostTest::shortMainWrite=true; HostTest::clockMs+=300;
     check(!bad.service() && !bad.isReady() && bad.writeFailCount()==1,"short physical main write fails visibly and stops the logger");
     check(bad.mainPendingBytes()>0 && bad.mainWrittenRows()==0,"short write does not falsely acknowledge complete buffered rows");
+    HostTest::shortMainWrite=false;
+    for(unsigned i=0;i<1000;++i) { bad.service(); HostTest::clockMs+=20; }
+    check(bad.isReady() && bad.mainSyncedRows()==1,"short write recovers and replays the retained row");
     HostTest::reset(); DataLogger syncBad;
     check(syncBad.begin(3.01f,2.572f,2.184f,true,"HOST_TEST"),"sync fault logger startup");
     HostTest::failSync=true; HostTest::clockMs+=SD_LOG_SYNC_INTERVAL_MS;
     for(unsigned i=0;i<8 && syncBad.isReady();++i) { syncBad.service(); HostTest::clockMs+=20; }
     check(!syncBad.isReady() && syncBad.writeFailCount()==1,"sync error is checked and stops logging visibly");
+    HostTest::failSync=false;
+    for(unsigned i=0;i<1000;++i) { syncBad.service(); HostTest::clockMs+=20; }
+    check(syncBad.isReady(),"sync error recovers without reboot");
     for (bool shortWrite : {true, false}) {
         HostTest::reset(); DataLogger phBad;
         check(phBad.begin(3.01f,2.572f,2.184f,true,"HOST_TEST"),"pH-only fault startup");
@@ -133,17 +139,19 @@ int main(int argc, char** argv) {
         for(unsigned i=0;i<80 && !phBad.phDiagnosticStopped();++i) { phBad.service(); HostTest::clockMs+=20; }
         check(phBad.isReady() && phBad.writeFailCount()==0 && phBad.phDiagnosticWriteFailCount()==1,"pH-only write/sync error is isolated from main");
         check(phBad.phDiagnosticStopped() && phBad.phSyncedRows()==0,"failed pH rows never falsely reported synced");
-        const size_t retained=phBad.phPendingBytes();
+        HostTest::shortPhWrite=false; HostTest::failPhSync=false;
+        for(unsigned i=0;i<1000;++i) { phBad.service(); HostTest::clockMs+=20; }
+        check(phBad.isReady() && phBad.mainSyncedRows()==1 && phBad.phSyncedRows()==1,"pH fault recovers retained unconfirmed records");
         for(unsigned i=2;i<=80;++i) {
             check(phBad.canAcceptLogPair(),"failed pH buffer cannot block main dequeue");
             auto next=row(i,HostTest::clockMs);
             check(phBad.logRecord(next),"main continues after pH fault");
-            check(!phBad.logPhDiagnostic(next.boot_ms,i,next.ph_diagnostic),"future pH loss explicitly rejected/counted");
+            check(phBad.logPhDiagnostic(next.boot_ms,i,next.ph_diagnostic),"future pH records accepted after recovery");
             phBad.service(); HostTest::clockMs+=50;
         }
-        for(unsigned i=0;i<80 && phBad.mainSyncedRows()!=80;++i) { phBad.service(); HostTest::clockMs+=20; }
-        check(phBad.mainSyncedRows()==80 && phBad.phSyncedRows()==0 && phBad.phDiagnosticWriteFailCount()==80,"main remains durable and pH losses counted");
-        check(phBad.phPendingBytes()==retained,"failed pH bytes retained without retry/duplicate append");
+        for(unsigned i=0;i<80 && (phBad.mainSyncedRows()!=80 || phBad.phSyncedRows()!=80);++i) { phBad.service(); HostTest::clockMs+=20; }
+        check(phBad.mainSyncedRows()==80 && phBad.phSyncedRows()==80 && phBad.phDiagnosticWriteFailCount()==1,"both streams durable after pH fault recovery");
+        check(phBad.phPendingBytes()==0,"all recovered pH bytes acknowledged only after sync");
     }
     HostTest::reset(); DataLogger txBad;
     check(txBad.begin(3.01f,2.572f,2.184f,true,"HOST_TEST"),"TX-only sync fault startup");
@@ -151,7 +159,9 @@ int main(int argc, char** argv) {
     check(txBad.logRecord(first) && txBad.logPhDiagnostic(first.boot_ms,1,first.ph_diagnostic) && txBad.logTxDiagnostic(tx(1,HostTest::clockMs)),"TX sync fault records accepted");
     HostTest::failTxSync=true;
     for(unsigned i=0;i<50;++i) { txBad.service(); HostTest::clockMs+=20; }
-    check(txBad.isReady() && txBad.writeFailCount()==0 && txBad.txDiagnosticWriteFailCount()>0,"TX-only sync error counted without stopping main");
+    HostTest::failTxSync=false;
+    for(unsigned i=0;i<1000;++i) { txBad.service(); HostTest::clockMs+=20; }
+    check(txBad.isReady() && txBad.writeFailCount()==0 && txBad.txDiagnosticWriteFailCount()>0,"TX-only sync error counted and recovery completes");
     check(txBad.mainSyncedRows()==1 && txBad.phSyncedRows()==1,"main and pH synced despite TX-only failure");
     HostTest::reset(); DataLogger timeBad;
     check(timeBad.begin(3.01f,2.572f,2.184f,true,"HOST_TEST"),"timestamp cache fault startup");
@@ -159,6 +169,9 @@ int main(int argc, char** argv) {
     HostTest::failTimestampCache=true;
     for(unsigned i=0;i<50 && timeBad.isReady();++i) { timeBad.service(); HostTest::clockMs+=20; }
     check(!timeBad.isReady() && timeBad.writeFailCount()==1 && timeBad.mainSyncedRows()==0,"timestamp cache error stops main without false sync acknowledgment");
+    HostTest::failTimestampCache=false;
+    for(unsigned i=0;i<1000;++i) { timeBad.service(); HostTest::clockMs+=20; }
+    check(timeBad.isReady() && timeBad.mainSyncedRows()==1,"timestamp fault recovery retains unconfirmed data");
 #endif
     std::printf("RATE_TEST_FAILURES=%u\n",failures);return failures?1:0;
 }

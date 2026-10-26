@@ -46,6 +46,9 @@
 #define SD_LOG_MAX_BATCH_AGE_MS  250UL
 #define SD_LOG_SYNC_INTERVAL_MS  500UL
 #define SD_LOG_DURABILITY_MS     1000UL
+#define SD_LOG_TX_BUFFER_BYTES  4096
+#define SD_LOG_RECOVERY_RETRY_MS 1000UL
+#define SD_LOG_RECOVERY_MAX_RETRY_MS 8000UL
 
 
 // AA118 5:1. One 3S pack feeds motors + board; USB is programming only.
@@ -86,6 +89,16 @@
 #define GRID_HEADING_DEADZONE_DEG 2.0f
 #define GRID_STEERING_SLEW_PWM_PER_SEC 200.0f
 #define GRID_INTEGRAL_LIMIT_PWM 20.0f
+// Continuous GRID corner control; provisional until model/review/pond acceptance.
+#define GRID_BRAKE_HORIZON_S    0.25f
+#define GRID_BRAKE_WINDOW_DEG   60.0f
+#define GRID_BRAKE_BLEND_START_DPS 3.0f
+#define GRID_BRAKE_BLEND_FULL_DPS 12.0f
+#define GRID_SURGE_ROTATION_DEG 15.0f
+#define GRID_SURGE_ALIGN_DEG    LOS_TURN_FIRST_DEG
+#define GRID_SURGE_CURVE_DEG    90.0f
+#define GRID_SURGE_RISE_PWM_S   30.0f
+#define GRID_MIX_YAW_WEIGHT     9.0f
 #define MOTOR_APPROACH_PWM     110
 #define MOTOR_PWM_SLEW_PER_SEC 600.0f // ~30 PWM per 50 ms navigation tick
 

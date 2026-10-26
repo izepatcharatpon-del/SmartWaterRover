@@ -951,13 +951,14 @@ void navigationTask(void* pv) {
 
                                 float herr = HeadingController::computeHeadingError(
                                     los.bearingDeg, heading);
-                                int base = chooseBasePwm(
-                                    herr, los.distToEndM, GRID_CRUISE_PWM);
+                                // GRID owns its continuous surge/yaw allocation.
+                                const int base = GRID_CRUISE_PWM;
                                 logHeadingError = herr;
                                 logBasePwm = base;
                                 const DriveRequest gridRequest = gridHeading.update(
                                     los.bearingDeg, heading, base, compassSampleUs,
                                     compassOk);
+                                logBasePwm = (int)lroundf(gridHeading.surgePwm());
                                 leftPwm = gridRequest.leftPwm;
                                 rightPwm = gridRequest.rightPwm;
                                 driveSource = gridRequest.source;
@@ -1332,6 +1333,8 @@ void ioTask(void* pv) {
     unsigned long lastBattReport = 0;
     unsigned long lastSdCheck = 0;
     unsigned long lastRadioDiag = 0;
+    SdLogRecord pendingLogRec{};
+    bool havePendingLogRec = false;
 
     for (;;) {
         pollCalButton(ctx);
@@ -1501,7 +1504,7 @@ void ioTask(void* pv) {
                     }
                     xSemaphoreGive(ctx->stateMutex);
                 }
-                if (ctx->logger && ctx->logger->isReady()) {
+                if (ctx->logger) {
                     DiagnosticFormatting::TxLogRecord txLog{};
                     txLog.sequence = tp.sequence_number;
                     txLog.sendStartMs = txStartMs;
@@ -1571,36 +1574,43 @@ void ioTask(void* pv) {
             }
         }
 
-        SdLogRecord logRec;
         const uint32_t collectStarted = millis();
         for (unsigned rows = 0; rows < SD_LOG_ROWS_PER_IO_LOOP &&
              (uint32_t)(millis() - collectStarted) < SD_LOG_COLLECT_BUDGET_MS; ++rows) {
-            if (ctx->logger && ctx->logger->isReady() &&
-                !ctx->logger->canAcceptLogPair()) break; // Retain the record in the queue.
-            if (xQueueReceive(ctx->logQueue, &logRec, 0) != pdTRUE) break;
-            if (ctx->logger && ctx->logger->isReady()) {
-                if (!ctx->logger->logRecord(logRec)) {
-                    ctx->logDropCount++;
+            if (!havePendingLogRec) {
+                if (ctx->logger && !ctx->logger->canAcceptLogPair()) break;
+                if (xQueueReceive(ctx->logQueue, &pendingLogRec, 0) != pdTRUE) break;
+                havePendingLogRec = true;
+            }
+            if (ctx->logger) {
+                if (!ctx->logger->canAcceptLogPair()) break;
+                if (!ctx->logger->logRecord(pendingLogRec)) {
+                    if (ctx->logger->appendRejectedRecord()) {
+                        ++ctx->logDropCount; havePendingLogRec = false;
+                        continue; // Explicitly rejected malformed record, not a retryable lock/full result.
+                    }
+                    break; // Preserve the same row across a busy mutex or recovery backpressure.
                 }
                 if (!ctx->logger->logPhDiagnostic(
-                        logRec.boot_ms, logRec.sequence_number,
-                        logRec.ph_diagnostic) &&
+                        pendingLogRec.boot_ms, pendingLogRec.sequence_number,
+                        pendingLogRec.ph_diagnostic) &&
                     ctx->logger->phDiagnosticWriteFailCount() == 1) {
                     Serial.println(F("[USV] pH diagnostic writer failed; continuing"));
                 }
             } else {
-                ++ctx->logDropCount; // Explicit loss accounting when logging is unavailable.
+                ++ctx->logDropCount;
             }
+            havePendingLogRec = false;
         }
-        if (ctx->logger && ctx->logger->isReady() && !ctx->logger->service()) {
+        if (ctx->logger && !ctx->logger->service()) {
             Serial.println(F("[USV] SD service failed; inspect SD counters and queued data"));
         }
 
         if (ctx->logger &&
             millis() - lastSdCheck >= SD_INTEGRITY_MS) {
             lastSdCheck = millis();
-            if (!ctx->logger->checkIntegrity()) {
-                Serial.println(F("[USV] SD integrity FAIL — logging paused"));
+            if (!ctx->logger->checkIntegrity() && !ctx->logger->isReady()) {
+                Serial.println(F("[USV] SD not ready (recovery may be active); integrity FAIL — logging paused"));
             }
         }
 
@@ -1731,7 +1741,7 @@ void ioTask(void* pv) {
                 Serial.println(F("[SENSOR] SNAPSHOT_UNAVAILABLE (not a sensor failure)"));
             }
             if (ctx->logger) {
-                Serial.printf("[SD] ready=%u main=%lu/%lu/%lu ph=%lu/%lu/%lu pending_bytes=%u,%u max_service_ms=%lu max_sync_gap_ms=%lu sync_misses=%lu write_fail=%lu ph_fail=%lu tx_fail=%lu ph_stopped=%u queue=%u/%u\n",
+                Serial.printf("[SD] ready=%u main=%lu/%lu/%lu ph=%lu/%lu/%lu pending_bytes=%u,%u max_service_ms=%lu max_sync_gap_ms=%lu sync_misses=%lu write_fail=%lu ph_fail=%lu tx_fail=%lu ph_stopped=%u queue=%u/%u recovery=%lu/%lu stage=%s card_error=%u card_data=%lu pending_row=%u metadata_fail=%lu\n",
                     (unsigned)ctx->logger->isReady(),
                     (unsigned long)ctx->logger->mainAcceptedRows(), (unsigned long)ctx->logger->mainWrittenRows(), (unsigned long)ctx->logger->mainSyncedRows(),
                     (unsigned long)ctx->logger->phAcceptedRows(), (unsigned long)ctx->logger->phWrittenRows(), (unsigned long)ctx->logger->phSyncedRows(),
@@ -1740,7 +1750,11 @@ void ioTask(void* pv) {
                     (unsigned long)ctx->logger->syncDeadlineMisses(), (unsigned long)ctx->logger->writeFailCount(),
                     (unsigned long)ctx->logger->phDiagnosticWriteFailCount(), (unsigned long)ctx->logger->txDiagnosticWriteFailCount(),
                     (unsigned)ctx->logger->phDiagnosticStopped(),
-                    (unsigned)uxQueueMessagesWaiting(ctx->logQueue), (unsigned)SD_LOG_QUEUE_LENGTH);
+                    (unsigned)uxQueueMessagesWaiting(ctx->logQueue), (unsigned)SD_LOG_QUEUE_LENGTH,
+                    (unsigned long)ctx->logger->recoverySuccesses(), (unsigned long)ctx->logger->recoveryAttempts(),
+                    ctx->logger->faultStage(), (unsigned)ctx->logger->cardErrorCode(),
+                    (unsigned long)ctx->logger->cardErrorData(), (unsigned)havePendingLogRec,
+                    (unsigned long)ctx->logger->metadataWriteFailCount());
             }
 #endif
         }
